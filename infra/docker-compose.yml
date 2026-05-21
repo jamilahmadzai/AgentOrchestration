@@ -1,0 +1,41 @@
+services:
+  queue:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  storage:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: agent_orchestrator
+      POSTGRES_USER: agent_orchestrator
+      POSTGRES_PASSWORD: agent_orchestrator
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent_orchestrator -d agent_orchestrator"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  scheduler:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.scheduler
+    environment:
+      SCHEDULER_REQUIRE_QUEUE: "true"
+      SCHEDULER_REQUIRE_STORAGE: "true"
+      SCHEDULER_QUEUE_TCP: queue:6379
+      SCHEDULER_STORAGE_TCP: storage:5432
+    depends_on:
+      queue:
+        condition: service_healthy
+      storage:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-m", "src.orchestrator.health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 45s
+      retries: 3
