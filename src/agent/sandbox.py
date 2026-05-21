@@ -7,8 +7,16 @@ from typing import Dict, Optional
 from pathlib import Path
 
 
+PRIVATE_DIR_MODE = 0o700
+
+
 class ResourceLimits:
-    def __init__(self, cpu_time: int = 60, memory_mb: int = 512, disk_mb: int = 100):
+    def __init__(
+        self,
+        cpu_time: int = 60,
+        memory_mb: int = 512,
+        disk_mb: int = 100,
+    ):
         self.cpu_time = cpu_time
         self.memory_mb = memory_mb
         self.disk_mb = disk_mb
@@ -16,14 +24,56 @@ class ResourceLimits:
 
 class AgentSandbox:
     def __init__(self, base_path: Optional[str] = None):
-        self.base_path = Path(base_path or tempfile.mkdtemp(prefix="ao_sandbox_"))
+        root_path = base_path or tempfile.mkdtemp(prefix="ao_sandbox_")
+        self.base_path = Path(root_path)
+        self._ensure_private_directory(self.base_path)
         self._sandboxes: Dict[str, Path] = {}
 
-    def create(self, agent_id: str, limits: Optional[ResourceLimits] = None) -> Path:
+    def create(
+        self,
+        agent_id: str,
+        limits: Optional[ResourceLimits] = None,
+    ) -> Path:
         sandbox_path = self.base_path / agent_id
-        sandbox_path.mkdir(parents=True, exist_ok=True)
+        self._ensure_private_directory(sandbox_path)
         self._sandboxes[agent_id] = sandbox_path
         return sandbox_path
+
+    def _ensure_private_directory(self, path: Path) -> None:
+        if path.is_symlink():
+            raise ValueError(f"Refusing to use symlinked sandbox path: {path}")
+        if path.exists() and not path.is_dir():
+            raise ValueError(f"Sandbox path is not a directory: {path}")
+
+        missing_paths = []
+        current = path
+        while not current.exists():
+            missing_paths.append(current)
+            parent = current.parent
+            if parent == current:
+                break
+            current = parent
+
+        if current.is_symlink():
+            raise ValueError(
+                f"Refusing to create sandbox under symlink: {current}"
+            )
+        if current.exists() and not current.is_dir():
+            raise ValueError(f"Sandbox parent is not a directory: {current}")
+
+        path.mkdir(parents=True, exist_ok=True)
+
+        for directory in [path, *missing_paths]:
+            if directory.is_symlink():
+                raise ValueError(
+                    f"Refusing to chmod symlinked sandbox path: {directory}"
+                )
+            if not directory.is_dir():
+                raise ValueError(
+                    f"Sandbox path is not a directory: {directory}"
+                )
+            if os.name == "posix":
+                os.chmod(directory, PRIVATE_DIR_MODE)
 
     def destroy(self, agent_id: str) -> bool:
         sandbox = self._sandboxes.pop(agent_id, None)
@@ -38,10 +88,13 @@ class AgentSandbox:
 
     def apply_limits(self, agent_id: str, limits: ResourceLimits) -> None:
         try:
-            resource.setrlimit(resource.RLIMIT_CPU, (limits.cpu_time, limits.cpu_time))
+            resource.setrlimit(
+                resource.RLIMIT_CPU,
+                (limits.cpu_time, limits.cpu_time),
+            )
             mem_bytes = limits.memory_mb * 1024 * 1024
             resource.setrlimit(resource.RLIMIT_AS, (mem_bytes, mem_bytes))
-        except (ValueError, resource.error) as e:
+        except (ValueError, resource.error):
             pass
 
     def cleanup_all(self) -> None:
