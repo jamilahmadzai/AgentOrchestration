@@ -75,6 +75,45 @@ class TestTaskScheduler:
         assert "payload" not in deferred[0]
         assert "secret" not in str(deferred[0])
 
+    def test_duplicate_schedule_does_not_override_queued_task(self):
+        task_id = self.scheduler.enqueue({"type": "original"})
+
+        duplicate = {"id": task_id, "type": "duplicate"}
+        assert self.scheduler.schedule(duplicate, delay=0.0) == task_id
+
+        assert self.scheduler.task_state(task_id) == "queued"
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+        assert task["id"] == task_id
+        assert task["type"] == "original"
+        assert asyncio.run(self.scheduler.dequeue()) is None
+
+        rejected = [
+            event for event in self.scheduler.audit_events()
+            if event["action"] == "schedule_rejected"
+        ]
+        assert rejected[-1]["reason"] == "already_queued"
+
+    def test_duplicate_enqueue_does_not_override_scheduled_task(self):
+        delayed = {"type": "delayed"}
+        task_id = self.scheduler.schedule(delayed, delay=60.0, priority=5)
+
+        duplicate_id = self.scheduler.enqueue(delayed, priority=10)
+        assert duplicate_id == task_id
+
+        assert self.scheduler.task_state(task_id) == "scheduled"
+        assert delayed["state"] == "scheduled"
+        assert delayed["priority"] == 5
+        assert "enqueued_at" not in delayed
+        import asyncio
+        assert asyncio.run(self.scheduler.dequeue()) is None
+
+        rejected = [
+            event for event in self.scheduler.audit_events()
+            if event["action"] == "enqueue_rejected"
+        ]
+        assert rejected[-1]["reason"] == "already_scheduled"
+
     def test_duplicate_completion_does_not_overwrite_terminal_state(self):
         task_id = self.scheduler.enqueue({"type": "test"})
         import asyncio

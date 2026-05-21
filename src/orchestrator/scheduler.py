@@ -56,6 +56,20 @@ class TaskScheduler:
     ) -> str:
         with self._lock:
             task_id = task.get("id") or str(uuid4())
+            existing_reason = self._active_task_reason(task_id)
+            if existing_reason:
+                self._audit(
+                    task_id,
+                    "enqueue_rejected",
+                    queue=queue,
+                    reason=existing_reason,
+                    retries=int(task.get("retries", 0)),
+                )
+                metrics.increment(
+                    f"scheduler.enqueue_rejected.{existing_reason}"
+                )
+                return task_id
+
             task["id"] = task_id
             task["enqueued_at"] = time.time()
             task["retries"] = int(task.get("retries", 0))
@@ -73,6 +87,20 @@ class TaskScheduler:
     ) -> str:
         with self._lock:
             task_id = task.get("id") or str(uuid4())
+            existing_reason = self._active_task_reason(task_id)
+            if existing_reason:
+                self._audit(
+                    task_id,
+                    "schedule_rejected",
+                    queue=queue,
+                    reason=existing_reason,
+                    retries=int(task.get("retries", 0)),
+                )
+                metrics.increment(
+                    f"scheduler.schedule_rejected.{existing_reason}"
+                )
+                return task_id
+
             task["id"] = task_id
             task["retries"] = int(task.get("retries", 0))
             task["priority"] = priority
@@ -281,6 +309,15 @@ class TaskScheduler:
             )
             metrics.increment("scheduler.enqueue_rejected.in_flight")
             return False
+        if task_id in self._scheduled:
+            self._audit(
+                task_id,
+                "enqueue_rejected",
+                queue=queue,
+                reason="already_scheduled",
+            )
+            metrics.increment("scheduler.enqueue_rejected.scheduled")
+            return False
         if task_id in self._queued_task_ids:
             self._audit(
                 task_id,
@@ -329,6 +366,17 @@ class TaskScheduler:
             event["retries"] = retries
         self._audit_events.append(event)
 
+    def _active_task_reason(self, task_id: str) -> Optional[str]:
+        if task_id in self._terminal:
+            return "terminal"
+        if task_id in self._in_flight:
+            return "already_in_flight"
+        if task_id in self._scheduled:
+            return "already_scheduled"
+        if task_id in self._queued_task_ids:
+            return "already_queued"
+        return None
+
     def _missing_task_reason(self, task_id: str) -> str:
         if task_id in self._terminal:
             return "terminal"
@@ -342,6 +390,7 @@ class TaskScheduler:
         safe_reasons = {
             "already_in_flight",
             "already_queued",
+            "already_scheduled",
             "delayed",
             "failure",
             "new",
