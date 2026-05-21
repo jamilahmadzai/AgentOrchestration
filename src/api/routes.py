@@ -6,7 +6,7 @@ from typing import Dict, Optional
 from fastapi import APIRouter, HTTPException, Request
 
 from src.agent import AgentRegistry, AgentStatus
-from src.api.artifacts import artifact_service
+from src.api.artifacts import artifact_service, read_body_with_limit
 
 router = APIRouter()
 registry = AgentRegistry()
@@ -76,7 +76,12 @@ async def upload_agent_artifact(
         artifact_name=artifact_name,
         content_length=request.headers.get("content-length"),
         content_type=request.headers.get("content-type"),
-        read_body=request.body,
+        read_body=(
+            lambda max_body_bytes: read_body_with_limit(
+                request.stream(),
+                max_body_bytes,
+            )
+        ),
         agent_exists=(
             lambda candidate_agent_id: registry.get(candidate_agent_id)
             is not None

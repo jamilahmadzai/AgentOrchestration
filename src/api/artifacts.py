@@ -4,7 +4,7 @@ import hashlib
 import re
 import time
 from dataclasses import dataclass
-from typing import Callable, Dict, Optional
+from typing import AsyncIterator, Awaitable, Callable, Dict, Optional
 
 from fastapi import HTTPException
 
@@ -49,7 +49,7 @@ class ArtifactIngestionService:
         artifact_name: str,
         content_length: Optional[str],
         content_type: Optional[str],
-        read_body: Callable[[], bytes],
+        read_body: Callable[[int], Awaitable[bytes]],
         agent_exists: Callable[[str], bool],
     ) -> ArtifactRecord:
         declared_size = self._validate_request(
@@ -58,7 +58,7 @@ class ArtifactIngestionService:
             content_length,
         )
 
-        body = await read_body()
+        body = await read_body(self.max_body_bytes)
         body_size = len(body)
         if body_size == 0:
             raise HTTPException(
@@ -132,3 +132,20 @@ class ArtifactIngestionService:
 
 
 artifact_service = ArtifactIngestionService()
+
+
+async def read_body_with_limit(
+    chunks: AsyncIterator[bytes],
+    max_body_bytes: int,
+) -> bytes:
+    body = bytearray()
+    total_size = 0
+    async for chunk in chunks:
+        total_size += len(chunk)
+        if total_size > max_body_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail="Artifact body too large",
+            )
+        body.extend(chunk)
+    return bytes(body)

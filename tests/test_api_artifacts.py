@@ -3,7 +3,11 @@ import asyncio
 import pytest
 from fastapi.testclient import TestClient
 
-from src.api.artifacts import ArtifactIngestionService, artifact_service
+from src.api.artifacts import (
+    ArtifactIngestionService,
+    artifact_service,
+    read_body_with_limit,
+)
 from src.api.routes import registry
 from src.api.server import create_app
 
@@ -89,7 +93,7 @@ def test_malformed_artifact_name_fails_before_agent_lookup_or_mutation():
     service = ArtifactIngestionService()
     lookups = []
 
-    async def read_body():
+    async def read_body(_max_body_bytes):
         raise AssertionError("body should not be read for malformed requests")
 
     with pytest.raises(Exception) as exc_info:
@@ -113,7 +117,7 @@ def test_declared_oversized_upload_fails_before_agent_lookup_or_mutation():
     service = ArtifactIngestionService(max_body_bytes=8)
     lookups = []
 
-    async def read_body():
+    async def read_body(_max_body_bytes):
         raise AssertionError(
             "body should not be read for declared oversized requests"
         )
@@ -139,7 +143,7 @@ def test_actual_oversized_upload_fails_before_agent_lookup_or_mutation():
     service = ArtifactIngestionService(max_body_bytes=8)
     lookups = []
 
-    async def read_body():
+    async def read_body(_max_body_bytes):
         return b"too large"
 
     with pytest.raises(Exception) as exc_info:
@@ -157,6 +161,17 @@ def test_actual_oversized_upload_fails_before_agent_lookup_or_mutation():
     assert getattr(exc_info.value, "status_code", None) == 413
     assert lookups == []
     assert service.count() == 0
+
+
+def test_limited_body_reader_fails_when_stream_crosses_limit():
+    async def chunks():
+        yield b"1234"
+        yield b"56789"
+
+    with pytest.raises(Exception) as exc_info:
+        asyncio.run(read_body_with_limit(chunks(), max_body_bytes=8))
+
+    assert getattr(exc_info.value, "status_code", None) == 413
 
 
 def test_actual_oversized_upload_fails_without_mutating(client):
