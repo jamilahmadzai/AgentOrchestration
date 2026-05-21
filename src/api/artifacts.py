@@ -58,9 +58,6 @@ class ArtifactIngestionService:
             content_length,
         )
 
-        if not agent_exists(agent_id):
-            raise HTTPException(status_code=404, detail="Agent not found")
-
         body = await read_body()
         body_size = len(body)
         if body_size == 0:
@@ -78,6 +75,9 @@ class ArtifactIngestionService:
                 status_code=400,
                 detail="Content-Length does not match body size",
             )
+
+        if not agent_exists(agent_id):
+            raise HTTPException(status_code=404, detail="Agent not found")
 
         record = ArtifactRecord(
             agent_id=agent_id,

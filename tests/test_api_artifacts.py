@@ -135,6 +135,30 @@ def test_declared_oversized_upload_fails_before_agent_lookup_or_mutation():
     assert service.count() == 0
 
 
+def test_actual_oversized_upload_fails_before_agent_lookup_or_mutation():
+    service = ArtifactIngestionService(max_body_bytes=8)
+    lookups = []
+
+    async def read_body():
+        return b"too large"
+
+    with pytest.raises(Exception) as exc_info:
+        asyncio.run(
+            service.ingest(
+                agent_id="agent-1",
+                artifact_name="output.log",
+                content_length=None,
+                content_type="text/plain",
+                read_body=read_body,
+                agent_exists=lambda agent_id: lookups.append(agent_id) or True,
+            )
+        )
+
+    assert getattr(exc_info.value, "status_code", None) == 413
+    assert lookups == []
+    assert service.count() == 0
+
+
 def test_actual_oversized_upload_fails_without_mutating(client):
     service_limit = artifact_service.max_body_bytes
     artifact_service.max_body_bytes = 8
