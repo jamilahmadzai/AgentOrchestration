@@ -105,7 +105,7 @@ def test_wrong_audience_is_denied_before_handler(monkeypatch):
         headers=auth_header(service_token(aud="public-api")),
     )
 
-    assert response.status_code == 401
+    assert response.status_code == 403
     assert registry.count() == 0
 
 
@@ -177,6 +177,20 @@ def test_authorized_bearer_principal_can_complete_worker_flow(monkeypatch):
     assert listed.status_code == 200
     assert listed.json()["agents"][0]["id"] == agent_id
     assert registry.get(agent_id)["status"] == "running"
+
+
+def test_list_audience_authorizes_worker_flow(monkeypatch):
+    client = make_client(monkeypatch)
+
+    response = register_agent(
+        client,
+        headers=auth_header(
+            service_token(aud=["public-api", "agent-workers"]),
+        ),
+    )
+
+    assert response.status_code == 200
+    assert registry.count() == 1
 
 
 def test_session_cookie_uses_same_worker_auth_policy(monkeypatch):

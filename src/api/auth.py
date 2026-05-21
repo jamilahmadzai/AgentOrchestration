@@ -127,7 +127,7 @@ class ServiceTokenValidator:
 
         audience = _normalise_audience(payload.get("aud"))
         if self.audience not in audience:
-            raise AuthError("Invalid token audience")
+            raise AuthzError("Insufficient token audience")
 
         subject = payload.get("sub")
         if not isinstance(subject, str) or not subject.strip():
