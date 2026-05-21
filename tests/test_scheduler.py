@@ -1,4 +1,3 @@
-import pytest
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -35,6 +34,61 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_retry_preserves_task_identity_and_retry_count(self):
+        task_id = self.scheduler.enqueue({"type": "test"})
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert self.scheduler.fail(task["id"])
+        retried = asyncio.run(self.scheduler.dequeue())
+
+        assert retried["id"] == task_id
+        assert retried["retries"] == 1
+        assert self.scheduler.task_state(task_id) == "in_flight"
+
+    def test_poison_worker_crash_redelivery_is_deferred_and_audited(self):
+        scheduler = TaskScheduler(poison_redelivery_delay=60.0)
+        task_id = scheduler.enqueue({
+            "type": "test",
+            "payload": {"secret": "hidden"},
+        })
+        import asyncio
+        task = asyncio.run(scheduler.dequeue())
+
+        assert scheduler.fail(task["id"], reason="worker_crash_loop")
+
+        assert scheduler.task_state(task_id) == "scheduled"
+        assert asyncio.run(scheduler.dequeue()) is None
+
+        events = scheduler.audit_events()
+        deferred = [
+            event for event in events
+            if event["action"] == "redelivery_deferred"
+        ]
+        assert len(deferred) == 1
+        assert deferred[0]["task_id"] == task_id
+        assert deferred[0]["queue"] == "default"
+        assert deferred[0]["reason"] == "worker_crash_loop"
+        assert deferred[0]["retries"] == 1
+        assert isinstance(deferred[0]["at"], float)
+        assert "payload" not in deferred[0]
+        assert "secret" not in str(deferred[0])
+
+    def test_duplicate_completion_does_not_overwrite_terminal_state(self):
+        task_id = self.scheduler.enqueue({"type": "test"})
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert self.scheduler.complete(task["id"])
+        assert not self.scheduler.complete(task["id"])
+
+        assert self.scheduler.task_state(task_id) == "completed"
+        rejected = [
+            event for event in self.scheduler.audit_events()
+            if event["action"] == "ack_rejected"
+        ]
+        assert rejected[-1]["reason"] == "terminal"
 
 # 2019-01-09T19:07:03 update
 

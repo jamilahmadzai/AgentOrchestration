@@ -1,10 +1,12 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
 import time
-from typing import Any, Dict, Optional
+from threading import RLock
+from typing import Any, Dict, List, Optional, Set
 from uuid import uuid4
+
+from src.common.metrics import metrics
 
 
 class PriorityQueue:
@@ -31,55 +33,327 @@ class PriorityQueue:
 
 
 class TaskScheduler:
-    def __init__(self):
+    def __init__(
+        self,
+        max_retries: int = 3,
+        poison_redelivery_delay: float = 30.0,
+    ):
         self._queues: Dict[str, PriorityQueue] = {}
-        self._scheduled: Dict[str, float] = {}
+        self._scheduled: Dict[str, Dict[str, Any]] = {}
         self._in_flight: Dict[str, Dict] = {}
-        self._max_retries = 3
+        self._queued_task_ids: Set[str] = set()
+        self._terminal: Dict[str, Dict[str, Any]] = {}
+        self._audit_events: List[Dict[str, Any]] = []
+        self._max_retries = max_retries
+        self._poison_redelivery_delay = poison_redelivery_delay
+        self._lock = RLock()
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
-        task_id = str(uuid4())
-        task["id"] = task_id
-        task["enqueued_at"] = time.time()
-        task["retries"] = 0
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
+        with self._lock:
+            task_id = task.get("id") or str(uuid4())
+            task["id"] = task_id
+            task["enqueued_at"] = time.time()
+            task["retries"] = int(task.get("retries", 0))
+            task["priority"] = priority
 
+            self._enqueue_existing(task, queue, priority, reason="new")
+            return task_id
+
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
+        with self._lock:
+            task_id = task.get("id") or str(uuid4())
+            task["id"] = task_id
+            task["retries"] = int(task.get("retries", 0))
+            task["priority"] = priority
+            task["state"] = "scheduled"
+            self._scheduled[task_id] = {
+                "due_at": time.time() + delay,
+                "task": task,
+                "queue": queue,
+                "priority": priority,
+            }
+            self._audit(
+                task_id,
+                "scheduled",
+                queue=queue,
+                reason="delayed",
+                retries=task["retries"],
+            )
+            return task_id
+
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
+        del timeout
+        with self._lock:
+            now = time.time()
+            expired = [
+                tid for tid, item in self._scheduled.items()
+                if item["due_at"] <= now
+            ]
+            for tid in expired:
+                scheduled = self._scheduled.pop(tid)
+                self._enqueue_existing(
+                    scheduled["task"],
+                    scheduled["queue"],
+                    scheduled["priority"],
+                    reason="scheduled_due",
+                )
+
+            queue_obj = self._queues.get(queue)
+            while queue_obj and len(queue_obj) > 0:
+                task = queue_obj.pop()
+                if not task:
+                    continue
+                task_id = task["id"]
+                if task_id not in self._queued_task_ids:
+                    continue
+                self._queued_task_ids.remove(task_id)
+
+                if task_id in self._terminal:
+                    self._audit(
+                        task_id,
+                        "claim_rejected",
+                        queue=queue,
+                        reason="terminal",
+                    )
+                    metrics.increment("scheduler.claim_rejected.terminal")
+                    continue
+                if task_id in self._in_flight:
+                    self._audit(
+                        task_id,
+                        "claim_rejected",
+                        queue=queue,
+                        reason="already_in_flight",
+                    )
+                    metrics.increment("scheduler.claim_rejected.in_flight")
+                    continue
+
+                task["state"] = "in_flight"
+                task["last_claimed_at"] = now
+                self._in_flight[task_id] = task
+                self._audit(
+                    task_id,
+                    "claimed",
+                    queue=queue,
+                    retries=task.get("retries", 0),
+                )
+                return task
+            return None
+
+    def complete(self, task_id: str) -> bool:
+        with self._lock:
+            task = self._in_flight.pop(task_id, None)
+            if not task:
+                self._audit(
+                    task_id,
+                    "ack_rejected",
+                    reason=self._missing_task_reason(task_id),
+                )
+                metrics.increment("scheduler.ack_rejected")
+                return False
+
+            task["state"] = "completed"
+            self._terminal[task_id] = {
+                "state": "completed",
+                "retries": task.get("retries", 0),
+                "completed_at": time.time(),
+            }
+            self._audit(task_id, "completed", retries=task.get("retries", 0))
+            metrics.increment("scheduler.completed")
+            return True
+
+    def fail(
+        self,
+        task_id: str,
+        queue: str = "default",
+        reason: str = "failure",
+    ) -> bool:
+        with self._lock:
+            task = self._in_flight.pop(task_id, None)
+            if not task:
+                self._audit(
+                    task_id,
+                    "ack_rejected",
+                    reason=self._missing_task_reason(task_id),
+                )
+                metrics.increment("scheduler.ack_rejected")
+                return False
+
+            task["retries"] = int(task.get("retries", 0)) + 1
+            retries = task["retries"]
+            if retries >= self._max_retries:
+                task["state"] = "failed"
+                self._terminal[task_id] = {
+                    "state": "failed",
+                    "reason": self._safe_reason(reason),
+                    "retries": retries,
+                    "failed_at": time.time(),
+                }
+                self._audit(
+                    task_id,
+                    "failed_terminal",
+                    queue=queue,
+                    reason=reason,
+                    retries=retries,
+                )
+                metrics.increment("scheduler.failed_terminal")
+                return False
+
+            priority = int(task.get("priority", 0))
+            if reason == "worker_crash_loop":
+                task["state"] = "scheduled"
+                self._scheduled[task_id] = {
+                    "due_at": time.time() + self._poison_redelivery_delay,
+                    "task": task,
+                    "queue": queue,
+                    "priority": priority,
+                }
+                self._audit(
+                    task_id,
+                    "redelivery_deferred",
+                    queue=queue,
+                    reason=reason,
+                    retries=retries,
+                )
+                metrics.increment("scheduler.redelivery_deferred.poison")
+                return True
+
+            return self._enqueue_existing(
+                task,
+                queue,
+                priority,
+                reason="retry",
+            )
+
+    def task_state(self, task_id: str) -> Optional[str]:
+        with self._lock:
+            if task_id in self._terminal:
+                return self._terminal[task_id]["state"]
+            if task_id in self._in_flight:
+                return "in_flight"
+            if task_id in self._scheduled:
+                return "scheduled"
+            if task_id in self._queued_task_ids:
+                return "queued"
+            return None
+
+    def audit_events(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            return [event.copy() for event in self._audit_events]
+
+    def _enqueue_existing(
+        self,
+        task: Dict,
+        queue: str,
+        priority: int,
+        reason: str,
+    ) -> bool:
+        task_id = task["id"]
+        if task_id in self._terminal:
+            self._audit(
+                task_id,
+                "enqueue_rejected",
+                queue=queue,
+                reason="terminal",
+            )
+            metrics.increment("scheduler.enqueue_rejected.terminal")
+            return False
+        if task_id in self._in_flight:
+            self._audit(
+                task_id,
+                "enqueue_rejected",
+                queue=queue,
+                reason="already_in_flight",
+            )
+            metrics.increment("scheduler.enqueue_rejected.in_flight")
+            return False
+        if task_id in self._queued_task_ids:
+            self._audit(
+                task_id,
+                "enqueue_rejected",
+                queue=queue,
+                reason="already_queued",
+            )
+            metrics.increment("scheduler.enqueue_rejected.duplicate")
+            return False
+
+        task["queue"] = queue
+        task["priority"] = priority
+        task["state"] = "queued"
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
         self._queues[queue].push(task, priority)
-        return task_id
+        self._queued_task_ids.add(task_id)
+        self._audit(
+            task_id,
+            "queued",
+            queue=queue,
+            reason=reason,
+            retries=task.get("retries", 0),
+        )
+        metrics.increment("scheduler.queued")
+        return True
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
-        task_id = str(uuid4())
-        task["id"] = task_id
-        self._scheduled[task_id] = time.time() + delay
-        return task_id
+    def _audit(
+        self,
+        task_id: str,
+        action: str,
+        queue: Optional[str] = None,
+        reason: Optional[str] = None,
+        retries: Optional[int] = None,
+    ) -> None:
+        event: Dict[str, Any] = {
+            "task_id": task_id,
+            "action": action,
+            "at": time.time(),
+        }
+        if queue is not None:
+            event["queue"] = queue
+        if reason is not None:
+            event["reason"] = self._safe_reason(reason)
+        if retries is not None:
+            event["retries"] = retries
+        self._audit_events.append(event)
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
-        now = time.time()
-        expired = [tid for tid, t in self._scheduled.items() if t <= now]
-        for tid in expired:
-            task = self._scheduled.pop(tid)
-            if task:
-                self.enqueue(task, queue)
+    def _missing_task_reason(self, task_id: str) -> str:
+        if task_id in self._terminal:
+            return "terminal"
+        if task_id in self._queued_task_ids:
+            return "queued_not_claimed"
+        if task_id in self._scheduled:
+            return "scheduled_not_claimed"
+        return "unknown"
 
-        if queue in self._queues and len(self._queues[queue]) > 0:
-            task = self._queues[queue].pop()
-            if task:
-                self._in_flight[task["id"]] = task
-                return task
-        return None
-
-    def complete(self, task_id: str) -> bool:
-        return self._in_flight.pop(task_id, None) is not None
-
-    def fail(self, task_id: str, queue: str = "default") -> bool:
-        task = self._in_flight.pop(task_id, None)
-        if task:
-            task["retries"] += 1
-            if task["retries"] < self._max_retries:
-                self.enqueue(task, queue, priority=task.get("priority", 0))
-                return True
-        return False
+    def _safe_reason(self, reason: str) -> str:
+        safe_reasons = {
+            "already_in_flight",
+            "already_queued",
+            "delayed",
+            "failure",
+            "new",
+            "queued_not_claimed",
+            "retry",
+            "scheduled_due",
+            "scheduled_not_claimed",
+            "terminal",
+            "unknown",
+            "worker_crash_loop",
+        }
+        return reason if reason in safe_reasons else "failure"
 
 # 2019-04-25T08:37:12 update
 
