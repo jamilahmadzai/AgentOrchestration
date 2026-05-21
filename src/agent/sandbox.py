@@ -3,12 +3,21 @@
 import os
 import tempfile
 import resource
+import stat
 from typing import Dict, Optional
 from pathlib import Path
 
 
+SANDBOX_DIRECTORY_MODE = 0o700
+
+
 class ResourceLimits:
-    def __init__(self, cpu_time: int = 60, memory_mb: int = 512, disk_mb: int = 100):
+    def __init__(
+        self,
+        cpu_time: int = 60,
+        memory_mb: int = 512,
+        disk_mb: int = 100,
+    ):
         self.cpu_time = cpu_time
         self.memory_mb = memory_mb
         self.disk_mb = disk_mb
@@ -16,14 +25,81 @@ class ResourceLimits:
 
 class AgentSandbox:
     def __init__(self, base_path: Optional[str] = None):
-        self.base_path = Path(base_path or tempfile.mkdtemp(prefix="ao_sandbox_"))
+        default_path = base_path or tempfile.mkdtemp(prefix="ao_sandbox_")
+        self.base_path = Path(default_path)
         self._sandboxes: Dict[str, Path] = {}
+        self._ensure_private_directory(self.base_path)
 
-    def create(self, agent_id: str, limits: Optional[ResourceLimits] = None) -> Path:
+    def create(
+        self,
+        agent_id: str,
+        limits: Optional[ResourceLimits] = None,
+    ) -> Path:
         sandbox_path = self.base_path / agent_id
-        sandbox_path.mkdir(parents=True, exist_ok=True)
+        self._ensure_private_directory(sandbox_path, anchor=self.base_path)
         self._sandboxes[agent_id] = sandbox_path
         return sandbox_path
+
+    def _ensure_private_directory(
+        self,
+        path: Path,
+        anchor: Optional[Path] = None,
+    ) -> None:
+        if anchor is not None:
+            self._ensure_private_subdirectory(path, anchor)
+            return
+
+        try:
+            path.mkdir(
+                mode=SANDBOX_DIRECTORY_MODE,
+                parents=True,
+                exist_ok=True,
+            )
+        except FileExistsError as exc:
+            message = f"sandbox path must be a directory: {path}"
+            raise ValueError(message) from exc
+
+        if os.name == "posix":
+            self._tighten_private_directory(path)
+
+    def _ensure_private_subdirectory(self, path: Path, anchor: Path) -> None:
+        current = anchor
+        if os.name == "posix":
+            self._tighten_private_directory(current)
+
+        for part in self._relative_sandbox_parts(path, anchor):
+            current = current / part
+            try:
+                current.mkdir(mode=SANDBOX_DIRECTORY_MODE, exist_ok=True)
+            except FileExistsError as exc:
+                message = f"sandbox path must be a directory: {current}"
+                raise ValueError(message) from exc
+            if os.name == "posix":
+                self._tighten_private_directory(current)
+
+    def _relative_sandbox_parts(
+        self,
+        path: Path,
+        anchor: Path,
+    ) -> tuple[str, ...]:
+        message = "sandbox path must stay under base directory"
+        try:
+            relative = path.relative_to(anchor)
+        except ValueError as exc:
+            raise ValueError(message) from exc
+
+        if any(part in ("", ".", "..") for part in relative.parts):
+            raise ValueError(message)
+
+        return relative.parts
+
+    def _tighten_private_directory(self, path: Path) -> None:
+        path_info = path.lstat()
+        if stat.S_ISLNK(path_info.st_mode):
+            raise ValueError(f"sandbox path must not be a symlink: {path}")
+        if not stat.S_ISDIR(path_info.st_mode):
+            raise ValueError(f"sandbox path must be a directory: {path}")
+        path.chmod(SANDBOX_DIRECTORY_MODE)
 
     def destroy(self, agent_id: str) -> bool:
         sandbox = self._sandboxes.pop(agent_id, None)
@@ -38,10 +114,13 @@ class AgentSandbox:
 
     def apply_limits(self, agent_id: str, limits: ResourceLimits) -> None:
         try:
-            resource.setrlimit(resource.RLIMIT_CPU, (limits.cpu_time, limits.cpu_time))
+            resource.setrlimit(
+                resource.RLIMIT_CPU,
+                (limits.cpu_time, limits.cpu_time),
+            )
             mem_bytes = limits.memory_mb * 1024 * 1024
             resource.setrlimit(resource.RLIMIT_AS, (mem_bytes, mem_bytes))
-        except (ValueError, resource.error) as e:
+        except (ValueError, resource.error):
             pass
 
     def cleanup_all(self) -> None:
