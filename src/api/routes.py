@@ -1,22 +1,35 @@
 """API route definitions."""
 
-from fastapi import APIRouter, HTTPException, Depends
-from typing import List, Dict, Optional
+from fastapi import APIRouter, Header, HTTPException
+from pydantic import BaseModel, Field
+from typing import Any, Dict, Optional
 
 from src.agent import AgentRegistry, AgentStatus
+from src.agent.registry import AgentConfigUpdateError
 
 router = APIRouter()
 registry = AgentRegistry()
 
 
+class AgentConfigUpdateRequest(BaseModel):
+    config: Dict[str, Any] = Field(default_factory=dict)
+
+
 @router.get("/agents")
-async def list_agents(status: Optional[str] = None, group: Optional[str] = None):
+async def list_agents(
+    status: Optional[str] = None,
+    group: Optional[str] = None,
+):
     status_filter = AgentStatus(status) if status else None
     return {"agents": registry.list(status=status_filter, group=group)}
 
 
 @router.post("/agents")
-async def register_agent(name: str, agent_type: str, config: Optional[Dict] = None):
+async def register_agent(
+    name: str,
+    agent_type: str,
+    config: Optional[Dict] = None,
+):
     agent_id = registry.register(name, agent_type, config)
     return {"agent_id": agent_id, "status": "registered"}
 
@@ -48,6 +61,27 @@ async def stop_agent(agent_id: str):
     if not registry.update_status(agent_id, AgentStatus.PAUSED):
         raise HTTPException(status_code=404, detail="Agent not found")
     return {"status": "stopped"}
+
+
+@router.put("/agents/{agent_id}/config")
+async def update_agent_config(
+    agent_id: str,
+    request: AgentConfigUpdateRequest,
+    if_match: Optional[str] = Header(default=None, alias="If-Match"),
+):
+    try:
+        agent = registry.update_config(agent_id, request.config, if_match)
+    except AgentConfigUpdateError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail=exc.detail,
+        ) from exc
+    return {
+        "agent_id": agent["id"],
+        "config": agent["config"],
+        "config_version": agent["config_version"],
+        "config_etag": agent["config_etag"],
+    }
 
 
 @router.get("/agents/count")

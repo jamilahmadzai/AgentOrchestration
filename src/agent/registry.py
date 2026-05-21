@@ -1,6 +1,7 @@
 """Agent Registry — Manages agent lifecycle and metadata."""
 
-import json
+import copy
+import hashlib
 import time
 import uuid
 from enum import Enum
@@ -16,13 +17,43 @@ class AgentStatus(Enum):
     TERMINATED = "terminated"
 
 
+class AgentConfigUpdateError(ValueError):
+    status_code = 400
+
+    def __init__(self, detail: str):
+        super().__init__(detail)
+        self.detail = detail
+
+
+class AgentConfigPreconditionRequired(AgentConfigUpdateError):
+    status_code = 428
+
+
+class AgentConfigPreconditionFailed(AgentConfigUpdateError):
+    status_code = 412
+
+
+class AgentConfigNotFound(AgentConfigUpdateError):
+    status_code = 404
+
+
 class AgentRegistry:
     def __init__(self, storage_backend: str = "memory"):
         self.storage_backend = storage_backend
         self._agents: Dict[str, Dict[str, Any]] = {}
         self._index: Dict[str, List[str]] = {}
 
-    def register(self, name: str, agent_type: str, config: Optional[Dict] = None) -> str:
+    def _config_etag(self, agent_id: str, version: int) -> str:
+        payload = f"{agent_id}:{version}".encode("utf-8")
+        digest = hashlib.sha256(payload).hexdigest()[:16]
+        return f'"{digest}"'
+
+    def register(
+        self,
+        name: str,
+        agent_type: str,
+        config: Optional[Dict] = None,
+    ) -> str:
         agent_id = str(uuid.uuid4())
         timestamp = time.time()
         self._agents[agent_id] = {
@@ -31,6 +62,8 @@ class AgentRegistry:
             "type": agent_type,
             "status": AgentStatus.PENDING.value,
             "config": config or {},
+            "config_version": 1,
+            "config_etag": self._config_etag(agent_id, 1),
             "created_at": timestamp,
             "updated_at": timestamp,
             "version": "1.0.0",
@@ -45,7 +78,11 @@ class AgentRegistry:
     def get(self, agent_id: str) -> Optional[Dict[str, Any]]:
         return self._agents.get(agent_id)
 
-    def list(self, status: Optional[AgentStatus] = None, group: Optional[str] = None) -> List[Dict[str, Any]]:
+    def list(
+        self,
+        status: Optional[AgentStatus] = None,
+        group: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         agents = self._agents.values()
         if status:
             agents = [a for a in agents if a["status"] == status.value]
@@ -60,6 +97,40 @@ class AgentRegistry:
         self._agents[agent_id]["status"] = status.value
         self._agents[agent_id]["updated_at"] = time.time()
         return True
+
+    def update_config(
+        self,
+        agent_id: str,
+        config: Dict[str, Any],
+        if_match: Optional[str],
+    ) -> Dict[str, Any]:
+        if not isinstance(agent_id, str) or not agent_id.strip():
+            raise AgentConfigUpdateError("Agent id is required")
+        if not isinstance(config, dict):
+            raise AgentConfigUpdateError("Config must be an object")
+        if not isinstance(if_match, str) or not if_match.strip():
+            raise AgentConfigPreconditionRequired(
+                "If-Match header is required"
+            )
+        if if_match.strip() == "*":
+            raise AgentConfigPreconditionRequired(
+                "If-Match must contain the current config ETag"
+            )
+
+        agent = self._agents.get(agent_id)
+        if not agent:
+            raise AgentConfigNotFound("Agent not found")
+        if if_match.strip() != agent["config_etag"]:
+            raise AgentConfigPreconditionFailed(
+                "Config ETag does not match current agent config"
+            )
+
+        version = agent["config_version"] + 1
+        agent["config"] = copy.deepcopy(config)
+        agent["config_version"] = version
+        agent["config_etag"] = self._config_etag(agent_id, version)
+        agent["updated_at"] = time.time()
+        return copy.deepcopy(agent)
 
     def delete(self, agent_id: str) -> bool:
         if agent_id not in self._agents:
