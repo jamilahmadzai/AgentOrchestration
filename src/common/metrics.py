@@ -32,19 +32,26 @@ class MetricsCollector:
 
     def stop_timer(self, metric: str) -> float:
         with self._lock:
-            if metric in self._timers:
-                duration = time.time() - self._timers.pop(metric)
-                self.observe(metric, duration)
-                return duration
-        return 0.0
+            started_at = self._timers.pop(metric, None)
+        if started_at is None:
+            return 0.0
+        duration = time.time() - started_at
+        self.observe(metric, duration)
+        return duration
 
     def snapshot(self) -> Dict:
         with self._lock:
             return {
                 "counters": dict(self._counters),
                 "gauges": dict(self._gauges),
-                "histograms": {k: {"count": len(v), "sum": sum(v), "avg": sum(v) / len(v) if v else 0}
-                               for k, v in self._histograms.items()},
+                "histograms": {
+                    k: {
+                        "count": len(v),
+                        "sum": sum(v),
+                        "avg": sum(v) / len(v) if v else 0,
+                    }
+                    for k, v in self._histograms.items()
+                },
             }
 
 
