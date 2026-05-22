@@ -1,22 +1,52 @@
 """API route definitions."""
 
-from fastapi import APIRouter, HTTPException, Depends
-from typing import List, Dict, Optional
+from fastapi import APIRouter, HTTPException, Response
+from pydantic import BaseModel, Field
+from typing import Any, Dict, Optional
 
 from src.agent import AgentRegistry, AgentStatus
+from src.api.webhooks import (
+    WebhookDisabledError,
+    WebhookNotFoundError,
+    WebhookRegistry,
+    WebhookValidationError,
+)
 
 router = APIRouter()
 registry = AgentRegistry()
+webhooks = WebhookRegistry()
+
+
+class WebhookRegistration(BaseModel):
+    workspace_id: str
+    callback_url: str
+
+
+class WebhookWorkspaceRequest(BaseModel):
+    workspace_id: str
+
+
+class WebhookDeliveryRequest(BaseModel):
+    workspace_id: str
+    event_id: str
+    payload: Dict[str, Any] = Field(default_factory=dict)
 
 
 @router.get("/agents")
-async def list_agents(status: Optional[str] = None, group: Optional[str] = None):
+async def list_agents(
+    status: Optional[str] = None,
+    group: Optional[str] = None,
+):
     status_filter = AgentStatus(status) if status else None
     return {"agents": registry.list(status=status_filter, group=group)}
 
 
 @router.post("/agents")
-async def register_agent(name: str, agent_type: str, config: Optional[Dict] = None):
+async def register_agent(
+    name: str,
+    agent_type: str,
+    config: Optional[Dict] = None,
+):
     agent_id = registry.register(name, agent_type, config)
     return {"agent_id": agent_id, "status": "registered"}
 
@@ -53,6 +83,61 @@ async def stop_agent(agent_id: str):
 @router.get("/agents/count")
 async def agent_count():
     return {"count": registry.count()}
+
+
+@router.post("/webhooks", status_code=201)
+async def register_webhook(payload: WebhookRegistration, response: Response):
+    try:
+        endpoint, created = webhooks.register(
+            workspace_id=payload.workspace_id,
+            callback_url=payload.callback_url,
+        )
+    except WebhookValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    if not created:
+        response.status_code = 200
+    return endpoint.public_dict(created=created)
+
+
+@router.post("/webhooks/{endpoint_id}/disable")
+async def disable_webhook(endpoint_id: str, payload: WebhookWorkspaceRequest):
+    try:
+        endpoint = webhooks.disable(
+            workspace_id=payload.workspace_id,
+            endpoint_id=endpoint_id,
+        )
+    except WebhookValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except WebhookNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    return endpoint.public_dict(created=False)
+
+
+@router.post("/webhooks/{endpoint_id}/deliveries", status_code=202)
+async def create_webhook_delivery(
+    endpoint_id: str,
+    payload: WebhookDeliveryRequest,
+    response: Response,
+):
+    try:
+        delivery, created = webhooks.deliver(
+            workspace_id=payload.workspace_id,
+            endpoint_id=endpoint_id,
+            event_id=payload.event_id,
+            payload=payload.payload,
+        )
+    except WebhookValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except WebhookNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except WebhookDisabledError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    if not created:
+        response.status_code = 200
+    return delivery.public_dict(created=created)
 
 # 2019-03-18T11:10:18 update
 
