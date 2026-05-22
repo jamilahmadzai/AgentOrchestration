@@ -1,6 +1,7 @@
 """Webhook subscription and delivery API."""
 
 import hashlib
+import ipaddress
 import json
 import time
 import uuid
@@ -56,26 +57,63 @@ def _now() -> float:
 
 def _validate_target_url(target_url: str) -> None:
     parsed = urlparse(target_url)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+    if (
+        parsed.scheme != "https"
+        or not parsed.netloc
+        or _is_local_target(parsed.hostname)
+    ):
         raise HTTPException(
             status_code=400,
             detail={
                 "error": "invalid_target_url",
-                "message": "target_url must be an HTTP(S) URL",
+                "message": (
+                    "target_url must be a public HTTPS URL and must not "
+                    "target localhost"
+                ),
             },
         )
+
+
+def _is_local_target(hostname: Optional[str]) -> bool:
+    if not hostname:
+        return True
+    normalized = hostname.strip().lower().rstrip(".")
+    if normalized in {"localhost", "0", "0.0.0.0"}:
+        return True
+    try:
+        address = ipaddress.ip_address(normalized)
+    except ValueError:
+        return False
+    return (
+        address.is_loopback
+        or address.is_link_local
+        or address.is_unspecified
+    )
 
 
 def _normalize_event_type(event_type: str) -> str:
     return event_type.strip().lower()
 
 
-def _normalize_event_types(event_types: List[str]) -> List[str]:
+def _validate_event_types(event_types: List[str]) -> List[str]:
     normalized: List[str] = []
+    invalid: List[str] = []
     for event_type in event_types:
         candidate = _normalize_event_type(event_type)
-        if candidate and candidate not in normalized:
+        if not candidate or candidate not in ALLOWED_EVENT_TYPES:
+            invalid.append(candidate)
+            continue
+        if candidate not in normalized:
             normalized.append(candidate)
+    if invalid or not normalized:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "invalid_event_types",
+                "invalid_event_types": invalid,
+                "allowed_event_types": sorted(ALLOWED_EVENT_TYPES),
+            },
+        )
     return normalized
 
 
@@ -106,21 +144,7 @@ class WebhookStore:
         self,
         request: SubscriptionCreate,
     ) -> Dict[str, Any]:
-        event_types = _normalize_event_types(request.event_types)
-        invalid = [
-            event_type
-            for event_type in event_types
-            if event_type not in ALLOWED_EVENT_TYPES
-        ]
-        if invalid:
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "error": "invalid_event_types",
-                    "invalid_event_types": invalid,
-                    "allowed_event_types": sorted(ALLOWED_EVENT_TYPES),
-                },
-            )
+        event_types = _validate_event_types(request.event_types)
         _validate_target_url(request.target_url)
 
         timestamp = _now()

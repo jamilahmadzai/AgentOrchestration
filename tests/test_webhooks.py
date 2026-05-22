@@ -1,7 +1,7 @@
 from fastapi.testclient import TestClient
 
 from src.api.server import create_app
-from src.api.webhooks import webhook_store
+from src.api.webhooks import ALLOWED_EVENT_TYPES, webhook_store
 
 
 AUTH_HEADERS = {"Authorization": "Bearer test-token"}
@@ -52,6 +52,70 @@ def test_subscription_create_rejects_invalid_event_types_before_persistence():
     detail = response.json()["detail"]
     assert detail["error"] == "invalid_event_types"
     assert detail["invalid_event_types"] == ["internal.audit.dump"]
+
+    list_response = client.get(
+        "/api/v2/webhooks/subscriptions",
+        headers=AUTH_HEADERS,
+        params={"workspace_id": "workspace-a"},
+    )
+    assert list_response.status_code == 200
+    assert list_response.json()["subscriptions"] == []
+
+
+def test_subscription_create_rejects_blank_events_and_local_targets():
+    client = _client()
+
+    blank_event = client.post(
+        "/api/v2/webhooks/subscriptions",
+        headers=AUTH_HEADERS,
+        json={
+            "workspace_id": "workspace-a",
+            "target_url": "https://hooks.example.test/agents",
+            "event_types": ["agent.started", "   "],
+        },
+    )
+    assert blank_event.status_code == 400
+    assert blank_event.json()["detail"] == {
+        "error": "invalid_event_types",
+        "invalid_event_types": [""],
+        "allowed_event_types": sorted(ALLOWED_EVENT_TYPES),
+    }
+
+    insecure_target = client.post(
+        "/api/v2/webhooks/subscriptions",
+        headers=AUTH_HEADERS,
+        json={
+            "workspace_id": "workspace-a",
+            "target_url": "http://hooks.example.test/agents",
+            "event_types": ["agent.started"],
+        },
+    )
+    assert insecure_target.status_code == 400
+    assert insecure_target.json()["detail"]["error"] == "invalid_target_url"
+
+    local_target = client.post(
+        "/api/v2/webhooks/subscriptions",
+        headers=AUTH_HEADERS,
+        json={
+            "workspace_id": "workspace-a",
+            "target_url": "https://localhost/agents",
+            "event_types": ["agent.started"],
+        },
+    )
+    assert local_target.status_code == 400
+    assert local_target.json()["detail"]["error"] == "invalid_target_url"
+
+    loopback_target = client.post(
+        "/api/v2/webhooks/subscriptions",
+        headers=AUTH_HEADERS,
+        json={
+            "workspace_id": "workspace-a",
+            "target_url": "https://127.0.0.1/agents",
+            "event_types": ["agent.started"],
+        },
+    )
+    assert loopback_target.status_code == 400
+    assert loopback_target.json()["detail"]["error"] == "invalid_target_url"
 
     list_response = client.get(
         "/api/v2/webhooks/subscriptions",
