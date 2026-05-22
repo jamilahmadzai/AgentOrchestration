@@ -3,7 +3,7 @@ from enum import IntEnum
 
 import pytest
 
-from src.sdk.decorators import task
+from src.sdk.decorators import agent, on_event, task
 
 
 class RetryCount(IntEnum):
@@ -65,3 +65,29 @@ def test_task_timeout_uses_validated_task_name():
 
     with pytest.raises(TimeoutError, match="slow-task timed out"):
         asyncio.run(decorated())
+
+
+def test_agent_decorator_attaches_agent_config():
+    @agent(name="collector", version="2.1.0", description="Collects work")
+    class CollectorAgent:
+        pass
+
+    assert CollectorAgent.__agent_config__ == {
+        "name": "collector",
+        "version": "2.1.0",
+        "description": "Collects work",
+    }
+
+
+def test_on_event_attaches_event_metadata_and_wraps_handler():
+    calls = []
+
+    @on_event("task.created")
+    async def handle_event(payload):
+        calls.append(payload)
+        return "handled"
+
+    assert handle_event.__event_handler__ == "task.created"
+    assert handle_event.__name__ == "handle_event"
+    assert asyncio.run(handle_event({"id": "task-1"})) == "handled"
+    assert calls == [{"id": "task-1"}]
