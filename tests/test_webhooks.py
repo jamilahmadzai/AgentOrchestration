@@ -28,7 +28,7 @@ def register_endpoint(
 
 
 def test_normalize_webhook_url_canonicalizes_before_duplicate_checks():
-    url = "HTTPS://Hooks.Example.COM:443/team/../events?b=2&a=1"
+    url = "HTTPS://Hooks.Example.COM:443/team/../events/?b=2&a=1#ignored"
     assert (
         normalize_webhook_url(url)
         == "https://hooks.example.com/events?a=1&b=2"
@@ -40,7 +40,10 @@ def test_register_webhook_is_idempotent_per_workspace_after_normalization():
 
     first = register_endpoint(
         client,
-        callback_url="HTTPS://Hooks.Example.COM:443/team/../events?b=2&a=1",
+        callback_url=(
+            "HTTPS://Hooks.Example.COM:443/team/../events/?b=2&a=1"
+            "#ignored"
+        ),
     )
     second_response = client.post(
         "/api/v2/webhooks",
@@ -68,6 +71,46 @@ def test_register_webhook_is_idempotent_per_workspace_after_normalization():
     assert "normalized_url" not in first
     assert other_workspace["endpoint_id"] != first["endpoint_id"]
     assert service.endpoint_count() == 2
+
+
+def test_disabled_webhook_can_be_replaced_without_reusing_state():
+    client, service = client_with_fresh_webhooks()
+    disabled = register_endpoint(
+        client,
+        callback_url="https://hooks.example.com/events/",
+    )
+
+    disable_response = client.post(
+        f"/api/v2/webhooks/{disabled['endpoint_id']}/disable",
+        headers=AUTH_HEADERS,
+        json={"workspace_id": "workspace-a"},
+    )
+    replacement_response = client.post(
+        "/api/v2/webhooks",
+        headers=AUTH_HEADERS,
+        json={
+            "workspace_id": "workspace-a",
+            "callback_url": "https://HOOKS.example.com:443/events#ignored",
+        },
+    )
+    replacement = replacement_response.json()
+    delivery = client.post(
+        f"/api/v2/webhooks/{replacement['endpoint_id']}/deliveries",
+        headers=AUTH_HEADERS,
+        json={
+            "workspace_id": "workspace-a",
+            "event_id": "evt-replacement",
+            "payload": {},
+        },
+    )
+
+    assert disable_response.status_code == 200
+    assert replacement_response.status_code == 201
+    assert replacement["endpoint_id"] != disabled["endpoint_id"]
+    assert replacement["disabled"] is False
+    assert delivery.status_code == 202
+    assert service.endpoint_count() == 2
+    assert service.delivery_count() == 1
 
 
 def test_webhook_registration_requires_authorization_before_validation():

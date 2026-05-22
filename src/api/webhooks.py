@@ -91,7 +91,9 @@ class WebhookRegistry:
         existing_id = self._by_workspace_url.get(key)
 
         if existing_id is not None:
-            return self._endpoints[existing_id], False
+            existing = self._endpoints[existing_id]
+            if not existing.disabled:
+                return existing, False
 
         now = time.time()
         endpoint = WebhookEndpoint(
@@ -187,11 +189,6 @@ def normalize_webhook_url(callback_url: str) -> str:
         raise WebhookValidationError(
             "callback_url must not include credentials"
         )
-    if parts.fragment:
-        raise WebhookValidationError(
-            "callback_url must not include a fragment"
-        )
-
     host = parts.hostname.rstrip(".").lower()
     if host == "localhost" or host.endswith(".localhost"):
         raise WebhookValidationError("callback_url host is not allowed")
@@ -206,7 +203,7 @@ def normalize_webhook_url(callback_url: str) -> str:
             "callback_url has an invalid port"
         ) from exc
 
-    netloc = host if port in (None, 443) else f"{host}:{port}"
+    netloc = _format_netloc(host, port)
     path = _normalize_path(parts.path)
     query = _normalize_query(parts.query)
     return urlunsplit(("https", netloc, path, query, ""))
@@ -219,9 +216,16 @@ def _normalize_path(path: str) -> str:
         normalized = "/"
     if not normalized.startswith("/"):
         normalized = f"/{normalized}"
-    if decoded.endswith("/") and not normalized.endswith("/"):
-        normalized = f"{normalized}/"
+    if normalized != "/":
+        normalized = normalized.rstrip("/")
     return quote(normalized, safe="/:@!$&'()*+,;=-._~")
+
+
+def _format_netloc(host: str, port: Optional[int]) -> str:
+    bracketed_host = f"[{host}]" if ":" in host else host
+    if port in (None, 443):
+        return bracketed_host
+    return f"{bracketed_host}:{port}"
 
 
 def _normalize_query(query: str) -> str:
