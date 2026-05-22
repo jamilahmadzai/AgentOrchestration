@@ -2,15 +2,27 @@
 
 import functools
 import asyncio
-from typing import Any, Callable, Dict, Optional
+from numbers import Integral
+from typing import Callable, Optional
+
+
+def _validate_retry_count(retries: int) -> int:
+    if isinstance(retries, bool) or not isinstance(retries, Integral):
+        raise ValueError("retries must be a non-negative integer")
+    if retries < 0:
+        raise ValueError("retries must be a non-negative integer")
+    return int(retries)
 
 
 def task(name: Optional[str] = None, retries: int = 0, timeout: int = 300):
     """Decorator for marking a method as an agent task handler."""
+    retry_count = _validate_retry_count(retries)
+
     def decorator(func: Callable) -> Callable:
-        func.__task_config__ = {
-            "name": name or func.__name__,
-            "retries": retries,
+        task_name = name or func.__name__
+        task_config = {
+            "name": task_name,
+            "retries": retry_count,
             "timeout": timeout,
         }
 
@@ -23,8 +35,11 @@ def task(name: Optional[str] = None, retries: int = 0, timeout: int = 300):
                 )
                 return result
             except asyncio.TimeoutError:
-                raise TimeoutError(f"Task {name or func.__name__} timed out after {timeout}s")
+                raise TimeoutError(
+                    f"Task {task_name} timed out after {timeout}s"
+                )
 
+        wrapper.__task_config__ = task_config
         return wrapper
     return decorator
 
