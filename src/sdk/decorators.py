@@ -2,14 +2,15 @@
 
 import functools
 import asyncio
-from typing import Any, Callable, Dict, Optional
+from typing import Callable, Optional
 
 
 def task(name: Optional[str] = None, retries: int = 0, timeout: int = 300):
     """Decorator for marking a method as an agent task handler."""
     def decorator(func: Callable) -> Callable:
-        func.__task_config__ = {
-            "name": name or func.__name__,
+        task_name = name or func.__name__
+        task_config = {
+            "name": task_name,
             "retries": retries,
             "timeout": timeout,
         }
@@ -23,8 +24,11 @@ def task(name: Optional[str] = None, retries: int = 0, timeout: int = 300):
                 )
                 return result
             except asyncio.TimeoutError:
-                raise TimeoutError(f"Task {name or func.__name__} timed out after {timeout}s")
+                raise TimeoutError(
+                    f"Task {task_name} timed out after {timeout}s"
+                )
 
+        wrapper.__task_config__ = task_config
         return wrapper
     return decorator
 
@@ -44,12 +48,11 @@ def agent(name: str, version: str = "1.0.0", description: str = ""):
 def on_event(event_type: str):
     """Decorator for marking a method as an event handler."""
     def decorator(func: Callable) -> Callable:
-        func.__event_handler__ = event_type
-
         @functools.wraps(func)
         async def wrapper(*args, **kwargs):
             return await func(*args, **kwargs)
 
+        wrapper.__event_handler__ = event_type
         return wrapper
     return decorator
 
