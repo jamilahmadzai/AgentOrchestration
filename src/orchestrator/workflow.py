@@ -1,8 +1,11 @@
 """Workflow Manager — Defines and executes multi-step agent workflows."""
 
+import logging
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set
 from uuid import uuid4
+
+logger = logging.getLogger(__name__)
 
 
 class StepStatus(Enum):
@@ -12,14 +15,34 @@ class StepStatus(Enum):
     FAILED = "failed"
     SKIPPED = "skipped"
 
+    @property
+    def is_terminal(self) -> bool:
+        return self in {
+            StepStatus.COMPLETED,
+            StepStatus.FAILED,
+            StepStatus.SKIPPED,
+        }
+
+
+class WorkflowDependencyError(ValueError):
+    """Raised when a workflow dependency graph cannot be executed safely."""
+
 
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
+    def __init__(
+        self,
+        name: str,
+        handler: Callable,
+        retries: int = 0,
+        timeout: int = 300,
+        dependencies: Optional[List[str]] = None,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.handler = handler
         self.retries = retries
         self.timeout = timeout
+        self.dependencies = list(dependencies or [])
         self.status = StepStatus.PENDING
         self.result: Any = None
         self.error: Optional[str] = None
@@ -33,14 +56,113 @@ class Workflow:
         self.steps: List[WorkflowStep] = []
         self._step_map: Dict[str, WorkflowStep] = {}
         self.status = StepStatus.PENDING
+        self.audit_records: List[Dict[str, Any]] = []
 
     def add_step(self, step: WorkflowStep) -> "Workflow":
+        if step.id in self._step_map:
+            raise WorkflowDependencyError("duplicate workflow step id")
         self.steps.append(step)
         self._step_map[step.id] = step
         return self
 
+    def add_step_with_dependencies(
+        self,
+        step: WorkflowStep,
+        dependencies: List[WorkflowStep],
+    ) -> "Workflow":
+        step.dependencies = [dependency.id for dependency in dependencies]
+        return self.add_step(step)
+
     def get_step(self, step_id: str) -> Optional[WorkflowStep]:
         return self._step_map.get(step_id)
+
+    def validate_dependencies(self) -> List[str]:
+        errors: List[str] = []
+
+        for step in self.steps:
+            for dependency_id in step.dependencies:
+                if dependency_id not in self._step_map:
+                    errors.append("unknown dependency")
+
+        visiting: Set[str] = set()
+        visited: Set[str] = set()
+
+        def visit(step_id: str) -> None:
+            if step_id in visiting:
+                errors.append("cyclic dependency")
+                return
+            if step_id in visited:
+                return
+            visiting.add(step_id)
+            step = self._step_map.get(step_id)
+            if step is not None:
+                for dependency_id in step.dependencies:
+                    if dependency_id in self._step_map:
+                        visit(dependency_id)
+            visiting.remove(step_id)
+            visited.add(step_id)
+
+        for step in self.steps:
+            visit(step.id)
+        return errors
+
+    def dependency_decision(self, step: WorkflowStep) -> Dict[str, Any]:
+        failed_dependencies = []
+        waiting_dependencies = []
+
+        for dependency_id in step.dependencies:
+            dependency = self._step_map.get(dependency_id)
+            if dependency is None:
+                return {
+                    "allowed": False,
+                    "decision": "reject_unknown_dependency",
+                    "dependency_count": len(step.dependencies),
+                }
+            if dependency.status in {StepStatus.FAILED, StepStatus.SKIPPED}:
+                failed_dependencies.append(dependency.id)
+            elif dependency.status != StepStatus.COMPLETED:
+                waiting_dependencies.append(dependency.id)
+
+        if failed_dependencies:
+            return {
+                "allowed": False,
+                "decision": "reject_failed_dependency",
+                "dependency_count": len(step.dependencies),
+                "failed_dependencies": failed_dependencies,
+            }
+        if waiting_dependencies:
+            return {
+                "allowed": False,
+                "decision": "defer_dependency_not_ready",
+                "dependency_count": len(step.dependencies),
+                "waiting_dependencies": waiting_dependencies,
+            }
+        return {
+            "allowed": True,
+            "decision": "allow",
+            "dependency_count": len(step.dependencies),
+        }
+
+    def record_dependency_decision(
+        self,
+        step: WorkflowStep,
+        decision: Dict[str, Any],
+    ) -> None:
+        record = {
+            "workflow_id": self.id,
+            "step_id": step.id,
+            "decision": decision["decision"],
+            "dependency_count": decision.get("dependency_count", 0),
+            "failed_dependencies": decision.get("failed_dependencies", []),
+            "waiting_dependencies": decision.get("waiting_dependencies", []),
+        }
+        self.audit_records.append(record)
+        logger.info(
+            "workflow dependency decision workflow=%s step=%s decision=%s",
+            self.id,
+            step.id,
+            decision["decision"],
+        )
 
 
 class WorkflowManager:
@@ -51,6 +173,19 @@ class WorkflowManager:
         workflow = Workflow(name, description)
         self._workflows[workflow.id] = workflow
         return workflow
+
+    def register_workflow(self, workflow: Workflow) -> bool:
+        errors = workflow.validate_dependencies()
+        if errors:
+            workflow.audit_records.append({
+                "workflow_id": workflow.id,
+                "decision": "reject_invalid_dependency_graph",
+                "error_count": len(errors),
+            })
+            logger.warning("workflow rejected workflow=%s", workflow.id)
+            return False
+        self._workflows[workflow.id] = workflow
+        return True
 
     def get_workflow(self, workflow_id: str) -> Optional[Workflow]:
         return self._workflows.get(workflow_id)
@@ -66,21 +201,66 @@ class WorkflowManager:
         if not workflow:
             return False
 
-        workflow.status = StepStatus.RUNNING
-        for step in workflow.steps:
-            step.status = StepStatus.RUNNING
-            try:
-                result = step.handler()
-                step.result = result
-                step.status = StepStatus.COMPLETED
-            except Exception as e:
-                step.error = str(e)
-                step.status = StepStatus.FAILED
-                workflow.status = StepStatus.FAILED
-                return False
+        if workflow.validate_dependencies():
+            workflow.audit_records.append({
+                "workflow_id": workflow.id,
+                "decision": "reject_invalid_dependency_graph",
+            })
+            workflow.status = StepStatus.FAILED
+            return False
 
-        workflow.status = StepStatus.COMPLETED
-        return True
+        workflow.status = StepStatus.RUNNING
+        executed_or_blocked = True
+        failed = False
+
+        while executed_or_blocked:
+            executed_or_blocked = False
+            for step in workflow.steps:
+                if (
+                    step.status.is_terminal
+                    or step.status == StepStatus.RUNNING
+                ):
+                    continue
+
+                decision = workflow.dependency_decision(step)
+                if not decision["allowed"]:
+                    workflow.record_dependency_decision(step, decision)
+                    if decision["decision"] == "reject_failed_dependency":
+                        step.status = StepStatus.SKIPPED
+                        step.error = "dependency failed"
+                        failed = True
+                        executed_or_blocked = True
+                    continue
+
+                if step.dependencies:
+                    workflow.record_dependency_decision(step, decision)
+
+                executed_or_blocked = True
+                step.status = StepStatus.RUNNING
+                try:
+                    result = step.handler()
+                    step.result = result
+                    step.status = StepStatus.COMPLETED
+                except Exception:
+                    step.error = "handler failed"
+                    step.status = StepStatus.FAILED
+                    workflow.audit_records.append({
+                        "workflow_id": workflow.id,
+                        "step_id": step.id,
+                        "decision": "handler_failed",
+                    })
+                    failed = True
+
+        pending = [
+            step for step in workflow.steps
+            if step.status == StepStatus.PENDING
+        ]
+        if pending:
+            workflow.status = StepStatus.RUNNING
+            return False
+
+        workflow.status = StepStatus.FAILED if failed else StepStatus.COMPLETED
+        return not failed
 
 # 2019-03-27T19:58:07 update
 
