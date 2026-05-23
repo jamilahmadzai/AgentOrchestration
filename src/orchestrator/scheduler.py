@@ -1,10 +1,13 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
+import logging
+import math
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
+
+logger = logging.getLogger(__name__)
 
 
 class PriorityQueue:
@@ -31,54 +34,269 @@ class PriorityQueue:
 
 
 class TaskScheduler:
-    def __init__(self):
+    def __init__(self, visibility_timeout: float = 30.0):
         self._queues: Dict[str, PriorityQueue] = {}
-        self._scheduled: Dict[str, float] = {}
+        self._scheduled: Dict[str, Dict[str, Any]] = {}
         self._in_flight: Dict[str, Dict] = {}
         self._max_retries = 3
+        self._visibility_timeout = visibility_timeout
+        self._visibility_extensions: Dict[str, Dict[str, float]] = {}
+        self._audit_log: List[Dict[str, Any]] = []
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
-        task_id = str(uuid4())
-        task["id"] = task_id
-        task["enqueued_at"] = time.time()
-        task["retries"] = 0
+    def _audit(self, event: str, task_id: str, **details: Any) -> None:
+        safe_details = {
+            key: value
+            for key, value in details.items()
+            if key not in {"payload", "secret", "token", "lease_token"}
+        }
+        record = {
+            "event": event,
+            "task_id": task_id,
+            "at": time.time(),
+            "details": safe_details,
+        }
+        self._audit_log.append(record)
+        logger.info("queue visibility decision", extra={"audit": record})
+
+    def audit_log(self) -> List[Dict[str, Any]]:
+        return [record.copy() for record in self._audit_log]
+
+    def _queue_task(self, task: Dict, queue: str, priority: int = 0) -> str:
+        task_id = task.setdefault("id", str(uuid4()))
+        task.setdefault("enqueued_at", time.time())
+        task.setdefault("retries", 0)
+        task["queue"] = queue
+        task["priority"] = priority
+        task.pop("lease_token", None)
+        task.pop("visibility_deadline", None)
+        task.pop("dequeued_at", None)
+        self._visibility_extensions.pop(task_id, None)
 
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
         self._queues[queue].push(task, priority)
         return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
-        task_id = str(uuid4())
-        task["id"] = task_id
-        self._scheduled[task_id] = time.time() + delay
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
+        return self._queue_task(task, queue, priority)
+
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
+        task_id = task.setdefault("id", str(uuid4()))
+        task.setdefault("retries", 0)
+        task["queue"] = queue
+        task["priority"] = priority
+        self._scheduled[task_id] = {
+            "task": task,
+            "run_at": time.time() + delay,
+            "queue": queue,
+            "priority": priority,
+        }
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+    def _promote_due_scheduled(self, now: float) -> None:
+        due = [
+            tid
+            for tid, item in self._scheduled.items()
+            if item["run_at"] <= now
+        ]
+        for task_id in due:
+            item = self._scheduled.pop(task_id)
+            self._queue_task(item["task"], item["queue"], item["priority"])
+            self._audit(
+                "scheduled_task_promoted",
+                task_id,
+                queue=item["queue"],
+            )
+
+    def reap_expired_visibility(self, queue: Optional[str] = None) -> int:
+        """Return expired in-flight tasks to their queue for another worker."""
         now = time.time()
-        expired = [tid for tid, t in self._scheduled.items() if t <= now]
-        for tid in expired:
-            task = self._scheduled.pop(tid)
-            if task:
-                self.enqueue(task, queue)
+        expired = [
+            (task_id, task)
+            for task_id, task in self._in_flight.items()
+            if task.get("visibility_deadline", 0) <= now
+            and (queue is None or task.get("queue") == queue)
+        ]
+        for task_id, task in expired:
+            self._in_flight.pop(task_id, None)
+            self._queue_task(
+                task,
+                task.get("queue", "default"),
+                task.get("priority", 0),
+            )
+            self._audit(
+                "visibility_timeout_expired",
+                task_id,
+                queue=task.get("queue", "default"),
+            )
+        return len(expired)
+
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+        visibility_timeout: Optional[float] = None,
+    ) -> Optional[Dict]:
+        now = time.time()
+        self._promote_due_scheduled(now)
+        self.reap_expired_visibility(queue)
 
         if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()
             if task:
+                lease_seconds = self._visibility_timeout
+                if visibility_timeout is not None:
+                    lease_seconds = visibility_timeout
+                lease_token = str(uuid4())
+                task["lease_token"] = lease_token
+                task["visibility_deadline"] = now + lease_seconds
+                task["dequeued_at"] = now
+                task["queue"] = queue
                 self._in_flight[task["id"]] = task
+                self._audit(
+                    "task_dequeued",
+                    task["id"],
+                    queue=queue,
+                    visibility_deadline=task["visibility_deadline"],
+                )
                 return task
         return None
 
-    def complete(self, task_id: str) -> bool:
-        return self._in_flight.pop(task_id, None) is not None
+    def extend_visibility(
+        self,
+        task_id: str,
+        lease_token: str,
+        extension: float,
+        request_id: Optional[str] = None,
+    ) -> bool:
+        """Extend an active task lease for a long-running agent."""
+        if extension <= 0 or not math.isfinite(extension):
+            self._audit(
+                "visibility_extension_rejected",
+                task_id,
+                reason="invalid_extension",
+            )
+            return False
 
-    def fail(self, task_id: str, queue: str = "default") -> bool:
-        task = self._in_flight.pop(task_id, None)
-        if task:
-            task["retries"] += 1
-            if task["retries"] < self._max_retries:
-                self.enqueue(task, queue, priority=task.get("priority", 0))
+        task = self._in_flight.get(task_id)
+        if not task:
+            self._audit(
+                "visibility_extension_rejected",
+                task_id,
+                reason="not_in_flight",
+            )
+            return False
+        if task.get("lease_token") != lease_token:
+            self._audit(
+                "visibility_extension_rejected",
+                task_id,
+                reason="stale_lease",
+            )
+            return False
+
+        now = time.time()
+        if task.get("visibility_deadline", 0) <= now:
+            self.reap_expired_visibility(task.get("queue"))
+            self._audit(
+                "visibility_extension_rejected",
+                task_id,
+                reason="expired",
+            )
+            return False
+
+        if request_id:
+            extension_cache = self._visibility_extensions.setdefault(
+                task_id,
+                {},
+            )
+            if request_id in extension_cache:
+                task["visibility_deadline"] = max(
+                    task["visibility_deadline"],
+                    extension_cache[request_id],
+                )
+                self._audit(
+                    "visibility_extension_replayed",
+                    task_id,
+                    queue=task.get("queue"),
+                    visibility_deadline=task["visibility_deadline"],
+                )
                 return True
+
+        task["visibility_deadline"] = (
+            max(task["visibility_deadline"], now) + extension
+        )
+        if request_id:
+            self._visibility_extensions[task_id][request_id] = (
+                task["visibility_deadline"]
+            )
+        self._audit(
+            "visibility_extended",
+            task_id,
+            queue=task.get("queue"),
+            visibility_deadline=task["visibility_deadline"],
+        )
+        return True
+
+    def _active_task_for_ack(
+        self,
+        task_id: str,
+        lease_token: Optional[str],
+        action: str,
+    ) -> Optional[Dict]:
+        task = self._in_flight.get(task_id)
+        if not task:
+            self._audit(f"{action}_rejected", task_id, reason="not_in_flight")
+            return None
+        if lease_token is not None and task.get("lease_token") != lease_token:
+            self._audit(f"{action}_rejected", task_id, reason="stale_lease")
+            return None
+        if task.get("visibility_deadline", 0) <= time.time():
+            self.reap_expired_visibility(task.get("queue"))
+            self._audit(f"{action}_rejected", task_id, reason="expired")
+            return None
+        return task
+
+    def complete(
+        self,
+        task_id: str,
+        lease_token: Optional[str] = None,
+    ) -> bool:
+        task = self._active_task_for_ack(task_id, lease_token, "complete")
+        if not task:
+            return False
+        self._in_flight.pop(task_id, None)
+        self._visibility_extensions.pop(task_id, None)
+        self._audit("task_completed", task_id, queue=task.get("queue"))
+        return True
+
+    def fail(
+        self,
+        task_id: str,
+        queue: str = "default",
+        lease_token: Optional[str] = None,
+    ) -> bool:
+        task = self._active_task_for_ack(task_id, lease_token, "fail")
+        if not task:
+            return False
+        self._in_flight.pop(task_id, None)
+        task["retries"] += 1
+        if task["retries"] < self._max_retries:
+            self._queue_task(task, queue, priority=task.get("priority", 0))
+            self._audit("task_requeued_after_failure", task_id, queue=queue)
+            return True
+        self._visibility_extensions.pop(task_id, None)
+        self._audit("task_failed_permanently", task_id, queue=queue)
         return False
 
 # 2019-04-25T08:37:12 update

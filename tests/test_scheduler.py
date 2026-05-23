@@ -1,4 +1,3 @@
-import pytest
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -35,6 +34,134 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_long_running_task_extends_visibility_with_lease_token(self):
+        self.scheduler.enqueue({"type": "long-running"})
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue(visibility_timeout=0.01))
+        original_deadline = task["visibility_deadline"]
+
+        assert self.scheduler.extend_visibility(
+            task["id"],
+            task["lease_token"],
+            60.0,
+            request_id="heartbeat-1",
+        )
+        assert task["visibility_deadline"] > original_deadline
+        assert self.scheduler.complete(task["id"], task["lease_token"])
+        assert any(
+            record["event"] == "visibility_extended"
+            for record in self.scheduler.audit_log()
+        )
+
+    def test_visibility_extension_retry_is_idempotent(self):
+        self.scheduler.enqueue({"type": "long-running"})
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue(visibility_timeout=30.0))
+
+        assert self.scheduler.extend_visibility(
+            task["id"],
+            task["lease_token"],
+            15.0,
+            request_id="heartbeat-1",
+        )
+        extended_deadline = task["visibility_deadline"]
+        assert self.scheduler.extend_visibility(
+            task["id"],
+            task["lease_token"],
+            15.0,
+            request_id="heartbeat-1",
+        )
+        assert task["visibility_deadline"] == extended_deadline
+        assert any(
+            record["event"] == "visibility_extension_replayed"
+            for record in self.scheduler.audit_log()
+        )
+
+    def test_expired_visibility_requeues_and_rejects_stale_ack(self):
+        self.scheduler.enqueue({"type": "long-running"})
+        import asyncio
+        first = asyncio.run(self.scheduler.dequeue(visibility_timeout=30.0))
+        stale_token = first["lease_token"]
+        first["visibility_deadline"] = 0
+
+        assert not self.scheduler.complete(first["id"], stale_token)
+        second = asyncio.run(self.scheduler.dequeue())
+
+        assert second["id"] == first["id"]
+        assert second["lease_token"] != stale_token
+        assert self.scheduler.complete(second["id"], second["lease_token"])
+        assert any(
+            record["event"] == "visibility_timeout_expired"
+            for record in self.scheduler.audit_log()
+        )
+
+    def test_stale_worker_cannot_extend_or_fail_new_lease(self):
+        self.scheduler.enqueue({"type": "long-running"})
+        import asyncio
+        first = asyncio.run(self.scheduler.dequeue(visibility_timeout=30.0))
+        stale_token = first["lease_token"]
+        first["visibility_deadline"] = 0
+        self.scheduler.reap_expired_visibility()
+        second = asyncio.run(self.scheduler.dequeue())
+
+        assert not self.scheduler.extend_visibility(
+            first["id"],
+            stale_token,
+            10.0,
+        )
+        assert not self.scheduler.fail(first["id"], lease_token=stale_token)
+        assert self.scheduler.complete(second["id"], second["lease_token"])
+
+    def test_invalid_extension_does_not_mutate_deadline(self):
+        self.scheduler.enqueue({"type": "long-running"})
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue(visibility_timeout=30.0))
+        original_deadline = task["visibility_deadline"]
+
+        assert not self.scheduler.extend_visibility(
+            task["id"],
+            task["lease_token"],
+            0,
+        )
+        assert task["visibility_deadline"] == original_deadline
+
+    def test_scheduled_task_preserves_payload_queue_and_priority(self):
+        task_id = self.scheduler.schedule(
+            {"type": "scheduled", "payload": {"data": 1}},
+            delay=0,
+            queue="slow",
+            priority=7,
+        )
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue(queue="slow"))
+
+        assert task["id"] == task_id
+        assert task["type"] == "scheduled"
+        assert task["payload"] == {"data": 1}
+        assert task["queue"] == "slow"
+        assert task["priority"] == 7
+
+    def test_audit_records_explain_rejections_without_payload_or_tokens(self):
+        self.scheduler.enqueue(
+            {"type": "long-running", "payload": {"secret": "value"}}
+        )
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue(visibility_timeout=30.0))
+
+        assert not self.scheduler.extend_visibility(
+            task["id"],
+            "stale-token",
+            10.0,
+        )
+        audit = self.scheduler.audit_log()
+        rejection = audit[-1]
+
+        assert rejection["event"] == "visibility_extension_rejected"
+        assert rejection["details"]["reason"] == "stale_lease"
+        assert "payload" not in rejection["details"]
+        assert "token" not in rejection["details"]
+        assert "lease_token" not in rejection["details"]
 
 # 2019-01-09T19:07:03 update
 
