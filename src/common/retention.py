@@ -37,6 +37,11 @@ class RetentionException:
     expires_at: Optional[date]
     review_at: Optional[date]
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "category", _clean_text(self.category))
+        object.__setattr__(self, "owner", _clean_text(self.owner))
+        object.__setattr__(self, "reason", _clean_text(self.reason))
+
     @classmethod
     def from_mapping(
         cls,
@@ -49,12 +54,14 @@ class RetentionException:
             data,
             "expires_at",
             "expires_on",
+            "expiration",
             "expiration_date",
         )
         review_at = _first_present(
             data,
             "review_at",
             "review_on",
+            "review",
             "review_date",
         )
 
@@ -224,6 +231,8 @@ def _parse_date(value: Any) -> Optional[date]:
         return value
     if isinstance(value, str) and value.strip():
         value = value.strip()
+        if value.endswith("Z"):
+            value = f"{value[:-1]}+00:00"
         try:
             return datetime.fromisoformat(value).date()
         except ValueError:

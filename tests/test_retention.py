@@ -133,6 +133,32 @@ def test_active_report_groups_entries_by_owner_and_sorts_categories():
     ]
 
 
+def test_direct_exception_text_is_normalized_before_reporting():
+    registry = RetentionExceptionRegistry()
+    registry.add(
+        RetentionException(
+            category=" artifact-cache ",
+            owner=" security ",
+            reason=" incident review ",
+            expires_at=date(2026, 6, 15),
+            review_at=date(2026, 6, 1),
+        ),
+        today=TODAY,
+    )
+
+    report = registry.active_by_owner(today=TODAY)
+
+    assert list(report) == ["security"]
+    assert report["security"] == [
+        {
+            "category": "artifact-cache",
+            "reason": "incident review",
+            "expires_at": "2026-06-15",
+            "review_at": "2026-06-01",
+        }
+    ]
+
+
 def test_active_report_excludes_expired_but_still_flags_missing_metadata():
     registry = RetentionExceptionRegistry(
         [
@@ -181,8 +207,8 @@ def test_exception_can_be_loaded_from_mapping_aliases_with_trimmed_iso_dates():
             "data_category": " exports ",
             "data_owner": " privacy ",
             "justification": " subject access request ",
-            "expiration_date": "2026-07-01",
-            "review_date": "2026-06-15T09:00:00",
+            "expiration": "2026-07-01T00:00:00Z",
+            "review": "2026-06-15T09:00:00Z",
         }
     )
 
