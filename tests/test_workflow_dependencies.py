@@ -39,6 +39,27 @@ def test_fan_in_join_waits_for_dependencies_and_runs_once():
     )
 
 
+def test_sequential_workflow_without_dependencies_still_runs_in_order():
+    manager = WorkflowManager()
+    workflow = manager.create_workflow("sequential")
+    calls = []
+
+    workflow.add_step(
+        WorkflowStep("first", lambda: calls.append("first") or "first-ok")
+    )
+    workflow.add_step(
+        WorkflowStep("second", lambda: calls.append("second") or "second-ok")
+    )
+
+    assert manager.execute_workflow(workflow.id)
+    assert calls == ["first", "second"]
+    assert [step.status for step in workflow.steps] == [
+        StepStatus.COMPLETED,
+        StepStatus.COMPLETED,
+    ]
+    assert workflow.audit_records == []
+
+
 def test_failed_dependency_skips_fan_in_without_reviving_failure(caplog):
     manager = WorkflowManager()
     workflow = manager.create_workflow("fan-in-failure")
@@ -73,6 +94,38 @@ def test_failed_dependency_skips_fan_in_without_reviving_failure(caplog):
     ][0]
     assert failed_decision["step_id"] == join.id
     assert failed_decision["failed_dependencies"] == [left.id]
+
+
+def test_failed_dependency_skips_multiple_downstream_joins():
+    manager = WorkflowManager()
+    workflow = manager.create_workflow("fan-in-multiple")
+    calls = []
+
+    def fail_dependency():
+        calls.append("source")
+        raise RuntimeError("do not log this")
+
+    source = WorkflowStep("source", fail_dependency)
+    first_join = WorkflowStep("first-join", lambda: calls.append("first"))
+    second_join = WorkflowStep("second-join", lambda: calls.append("second"))
+
+    workflow.add_step(source)
+    workflow.add_step_with_dependencies(first_join, [source])
+    workflow.add_step_with_dependencies(second_join, [source])
+
+    assert not manager.execute_workflow(workflow.id)
+    assert calls == ["source"]
+    assert source.status == StepStatus.FAILED
+    assert first_join.status == StepStatus.SKIPPED
+    assert second_join.status == StepStatus.SKIPPED
+    skipped = [
+        record for record in workflow.audit_records
+        if record["decision"] == "reject_failed_dependency"
+    ]
+    assert [record["step_id"] for record in skipped] == [
+        first_join.id,
+        second_join.id,
+    ]
 
 
 def test_running_dependency_defers_join_and_preserves_pending_state():
