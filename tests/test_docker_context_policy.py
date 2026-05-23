@@ -115,6 +115,22 @@ def test_audit_allows_multistage_copy_from_named_stage(tmp_path):
     assert audit.ok, format_report(audit)
 
 
+def test_audit_ignores_dockerfiles_inside_excluded_local_dirs(tmp_path):
+    (tmp_path / ".dockerignore").write_text(
+        ".env\nnode_modules/\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "node_modules").mkdir()
+    (tmp_path / "node_modules" / "Dockerfile").write_text(
+        "COPY . /unused\n",
+        encoding="utf-8",
+    )
+
+    audit = audit_docker_context(tmp_path, probes=[".env"])
+
+    assert audit.ok, format_report(audit)
+
+
 def test_audit_passes_for_narrow_copy_policy(tmp_path):
     (tmp_path / ".dockerignore").write_text(
         ".env\nlogs/\n.venv/\ndebug/\n",

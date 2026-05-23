@@ -1,4 +1,7 @@
 .git/
+.github/
+.gitignore
+.dockerignore
 .venv/
 venv/
 env/
@@ -6,6 +9,8 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.uv/
+.uv-cache/
 .tox/
 .nox/
 htmlcov/
@@ -32,6 +37,12 @@ temp/
 scratch/
 outputs/
 artifacts/
+.secrets/
+secrets/
+credentials/
+credentials.*
+id_rsa*
+id_ed25519*
 *.tmp
 *.bak
 *.swp
@@ -40,6 +51,11 @@ artifacts/
 *.key
 *.crt
 *.csr
+*.cer
+*.cert
+*.der
+*.jks
+*.keystore
 *.p12
 *.pfx
 *.sqlite

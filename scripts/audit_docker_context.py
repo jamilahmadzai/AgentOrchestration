@@ -17,8 +17,21 @@ DEFAULT_PROBES = (
     ".env.local",
     ".env.production",
     "config/.env.production",
+    ".github/workflows/ci.yml",
+    ".gitignore",
+    ".dockerignore",
+    ".uv/cache/archive",
+    ".uv-cache/archive",
+    ".secrets/token",
+    "secrets/local.json",
+    "credentials/aws",
+    "credentials.json",
+    "id_rsa_test",
+    "id_ed25519_test.pub",
     "secrets/private.key",
     "secrets/service.pem",
+    "secrets/service.cert",
+    "secrets/truststore.jks",
     "__pycache__/module.pyc",
     ".pytest_cache/CACHEDIR.TAG",
     ".mypy_cache/meta.json",
@@ -52,17 +65,21 @@ DEFAULT_PROBES = (
 
 PROHIBITED_SEGMENTS = {
     ".git",
+    ".github",
     ".idea",
     ".mypy_cache",
     ".nox",
     ".pytest_cache",
     ".ruff_cache",
     ".tox",
+    ".uv",
+    ".uv-cache",
     ".venv",
     ".vscode",
     "__pycache__",
     "artifacts",
     "build",
+    "credentials",
     "debug",
     "debug-output",
     "dist",
@@ -72,17 +89,28 @@ PROHIBITED_SEGMENTS = {
     "node_modules",
     "outputs",
     "scratch",
+    "secrets",
     "temp",
     "tmp",
     "venv",
 }
-PROHIBITED_NAMES = {".coverage", ".DS_Store", "Thumbs.db", "coverage.xml"}
+PROHIBITED_NAMES = {
+    ".coverage",
+    ".DS_Store",
+    "Thumbs.db",
+    "coverage.xml",
+}
 PROHIBITED_SUFFIXES = {
     ".bak",
+    ".cer",
+    ".cert",
     ".crt",
     ".csr",
     ".db",
+    ".der",
+    ".jks",
     ".key",
+    ".keystore",
     ".log",
     ".p12",
     ".pem",
@@ -282,7 +310,8 @@ def _matches_directory(pattern: str, candidate: str) -> bool:
 
 def _dockerfiles(root: Path) -> Iterable[Path]:
     for path in root.rglob("*"):
-        if any(part in {".git", ".venv"} for part in path.parts):
+        relative = _relative_path(path, root)
+        if _is_inside_prohibited_context_dir(relative):
             continue
         if path.is_file() and _is_dockerfile(path):
             yield path
@@ -295,6 +324,11 @@ def _is_dockerfile(path: Path) -> bool:
         or path.name.endswith(".Dockerfile")
         or path.suffix == ".dockerfile"
     )
+
+
+def _is_inside_prohibited_context_dir(candidate: str) -> bool:
+    parts = PurePosixPath(candidate.strip("/")).parts
+    return any(part in PROHIBITED_SEGMENTS for part in parts[:-1])
 
 
 def _dockerfile_logical_lines(path: Path) -> Iterable[tuple[int, str]]:
