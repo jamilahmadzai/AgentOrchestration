@@ -211,6 +211,7 @@ def test_insufficient_scope_or_role_fails_before_handler():
     cases = [
         (_token(scope="metrics:read"), "GET"),
         (_token(scope="agents:read"), "POST"),
+        (_token(scope={"agents:write": True}), "POST"),
         (_token(scope="agents:write", workspace_role="viewer"), "POST"),
         (_token(scope="agents:write", workspace_role="guest"), "POST"),
     ]
@@ -227,14 +228,24 @@ def test_insufficient_scope_or_role_fails_before_handler():
 def test_authorized_workspace_role_can_complete_mutating_workflow():
     client = TestClient(create_app())
 
-    response = client.post(
-        "/api/v2/agents",
-        params={"name": "worker-1", "agent_type": "worker.processor"},
-        headers=_headers(_token(scope="agents:write", workspace_role="admin")),
-    )
+    for audience, name in (
+        (BROWSER_AUDIENCE, "browser-worker"),
+        (SERVICE_AUDIENCE, "service-worker"),
+    ):
+        response = client.post(
+            "/api/v2/agents",
+            params={"name": name, "agent_type": "worker.processor"},
+            headers=_headers(
+                _token(
+                    aud=audience,
+                    scope="agents:write",
+                    workspace_role="admin",
+                )
+            ),
+        )
 
-    assert response.status_code == 200
-    assert response.json()["status"] == "registered"
+        assert response.status_code == 200
+        assert response.json()["status"] == "registered"
 
 
 def test_signed_token_tampering_is_denied():

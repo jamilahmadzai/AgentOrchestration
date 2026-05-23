@@ -8,7 +8,7 @@ import hmac
 import json
 import os
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Optional, Set
 
@@ -215,8 +215,8 @@ def _accepted_audience(value: Any) -> str:
 def _scopes(value: Any) -> Set[str]:
     if isinstance(value, str):
         return {scope for scope in value.split() if scope}
-    if isinstance(value, Iterable):
-        return {str(scope) for scope in value if str(scope)}
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return {scope for scope in value if isinstance(scope, str) and scope}
     return set()
 
 
