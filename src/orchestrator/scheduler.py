@@ -1,9 +1,10 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
 import time
-from typing import Any, Dict, Optional
+from collections import deque
+from threading import RLock
+from typing import Any, Callable, Deque, Dict, Iterable, List, Optional
 from uuid import uuid4
 
 
@@ -31,55 +32,352 @@ class PriorityQueue:
 
 
 class TaskScheduler:
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        clock: Callable[[], float] = time.time,
+        health_retry_delay: float = 30.0,
+        audit_limit: int = 100,
+    ):
         self._queues: Dict[str, PriorityQueue] = {}
-        self._scheduled: Dict[str, float] = {}
+        self._scheduled: Dict[str, Dict[str, Any]] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._dependency_health: Dict[str, Dict[str, Any]] = {}
+        self._queue_dependencies: Dict[str, List[str]] = {}
+        self._audit: Deque[Dict[str, Any]] = deque(maxlen=audit_limit)
         self._max_retries = 3
+        self._clock = clock
+        self._health_retry_delay = health_retry_delay
+        self._lock = RLock()
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
-        task_id = str(uuid4())
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
+        with self._lock:
+            return self._queue_task(
+                task,
+                queue,
+                priority,
+                preserve_id=False,
+            )
+
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
+        with self._lock:
+            return self._schedule_task(
+                task,
+                delay,
+                queue,
+                priority,
+                preserve_id=False,
+            )
+
+    def set_dependency_health(
+        self,
+        dependency: str,
+        healthy: bool,
+        reason: Optional[str] = None,
+    ) -> None:
+        name = self._normalize_dependency_name(dependency)
+        safe_reason = self._safe_reason(reason)
+        with self._lock:
+            self._dependency_health[name] = {
+                "healthy": bool(healthy),
+                "reason": safe_reason,
+                "updated_at": self._clock(),
+            }
+            self._record_audit(
+                "dependency_health_changed",
+                dependency=name,
+                healthy=bool(healthy),
+                reason=safe_reason,
+            )
+
+    def set_queue_dependencies(
+        self,
+        queue: str,
+        dependencies: Iterable[str],
+    ) -> None:
+        with self._lock:
+            self._queue_dependencies[queue] = self._normalize_dependencies(
+                dependencies,
+            )
+
+    def audit_records(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            return [dict(record) for record in self._audit]
+
+    def dependency_health_snapshot(self) -> Dict[str, Dict[str, Any]]:
+        with self._lock:
+            return {
+                dependency: dict(state)
+                for dependency, state in self._dependency_health.items()
+            }
+
+    def scheduled_ids(self) -> List[str]:
+        with self._lock:
+            return list(self._scheduled.keys())
+
+    def in_flight_ids(self) -> List[str]:
+        with self._lock:
+            return list(self._in_flight.keys())
+
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
+        with self._lock:
+            self._move_due_tasks()
+
+            if queue not in self._queues or len(self._queues[queue]) == 0:
+                return None
+
+            task = self._queues[queue].pop()
+            if not task:
+                return None
+
+            blocked = self._blocked_dependencies(task, queue)
+            if blocked:
+                self._defer_for_health_gate(task, queue, blocked)
+                return None
+
+            task_id = task["id"]
+            previous_gate = task.get("health_gate", {})
+            self._in_flight[task_id] = task
+            if previous_gate.get("decision") == "deferred":
+                task["health_gate"] = {
+                    "decision": "released",
+                    "released_at": self._clock(),
+                    "blocked_dependencies": previous_gate.get(
+                        "blocked_dependencies",
+                        [],
+                    ),
+                }
+                self._record_audit(
+                    "task_released_dependency_health_gate",
+                    task_id=task_id,
+                    queue=queue,
+                    blocked_dependencies=previous_gate.get(
+                        "blocked_dependencies",
+                        [],
+                    ),
+                )
+            return task
+
+    def complete(self, task_id: str) -> bool:
+        with self._lock:
+            return self._in_flight.pop(task_id, None) is not None
+
+    def fail(self, task_id: str, queue: str = "default") -> bool:
+        with self._lock:
+            task = self._in_flight.pop(task_id, None)
+            if task:
+                task["retries"] += 1
+                if task["retries"] < self._max_retries:
+                    self._queue_task(
+                        task,
+                        queue,
+                        priority=task.get("priority", 0),
+                        preserve_id=True,
+                    )
+                    return True
+            return False
+
+    def _queue_task(
+        self,
+        task: Dict,
+        queue: str,
+        priority: int,
+        *,
+        preserve_id: bool,
+    ) -> str:
+        task_id = task.get("id") if preserve_id else None
+        if not task_id:
+            task_id = str(uuid4())
         task["id"] = task_id
-        task["enqueued_at"] = time.time()
-        task["retries"] = 0
+        task["enqueued_at"] = self._clock()
+        task["queue"] = queue
+        task["priority"] = priority
+        if not preserve_id or "retries" not in task:
+            task["retries"] = 0
 
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
         self._queues[queue].push(task, priority)
         return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
-        task_id = str(uuid4())
+    def _schedule_task(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str,
+        priority: int,
+        *,
+        preserve_id: bool,
+    ) -> str:
+        task_id = task.get("id") if preserve_id else None
+        if not task_id:
+            task_id = str(uuid4())
+        now = self._clock()
+        due_at = now + max(delay, 0.0)
+
         task["id"] = task_id
-        self._scheduled[task_id] = time.time() + delay
+        task["queue"] = queue
+        task["priority"] = priority
+        task["scheduled_at"] = now
+        if not preserve_id or "retries" not in task:
+            task["retries"] = 0
+
+        self._scheduled[task_id] = {
+            "task": task,
+            "due_at": due_at,
+            "queue": queue,
+            "priority": priority,
+        }
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
-        now = time.time()
-        expired = [tid for tid, t in self._scheduled.items() if t <= now]
-        for tid in expired:
-            task = self._scheduled.pop(tid)
-            if task:
-                self.enqueue(task, queue)
+    def _move_due_tasks(self) -> None:
+        now = self._clock()
+        expired = [
+            task_id
+            for task_id, record in self._scheduled.items()
+            if record["due_at"] <= now
+        ]
+        for task_id in expired:
+            record = self._scheduled.pop(task_id)
+            self._queue_task(
+                record["task"],
+                record["queue"],
+                record["priority"],
+                preserve_id=True,
+            )
 
-        if queue in self._queues and len(self._queues[queue]) > 0:
-            task = self._queues[queue].pop()
-            if task:
-                self._in_flight[task["id"]] = task
-                return task
-        return None
+    def _blocked_dependencies(self, task: Dict, queue: str) -> List[str]:
+        blocked: List[str] = []
+        for dependency in self._task_dependencies(task, queue):
+            state = self._dependency_health.get(dependency)
+            if state and not state.get("healthy", True):
+                blocked.append(dependency)
+        return blocked
 
-    def complete(self, task_id: str) -> bool:
-        return self._in_flight.pop(task_id, None) is not None
+    def _task_dependencies(self, task: Dict, queue: str) -> List[str]:
+        dependencies: List[str] = []
+        dependencies.extend(self._queue_dependencies.get(queue, []))
+        for key in (
+            "required_dependencies",
+            "external_dependencies",
+            "health_dependencies",
+        ):
+            dependencies.extend(
+                self._normalize_dependencies(task.get(key)),
+            )
+        return sorted(set(dependencies))
 
-    def fail(self, task_id: str, queue: str = "default") -> bool:
-        task = self._in_flight.pop(task_id, None)
-        if task:
-            task["retries"] += 1
-            if task["retries"] < self._max_retries:
-                self.enqueue(task, queue, priority=task.get("priority", 0))
-                return True
-        return False
+    def _defer_for_health_gate(
+        self,
+        task: Dict,
+        queue: str,
+        blocked: List[str],
+    ) -> None:
+        now = self._clock()
+        retry_at = now + self._health_retry_delay
+        gate = task.get("health_gate", {})
+        deferrals = int(gate.get("deferrals", 0)) + 1
+        task["health_gate"] = {
+            "decision": "deferred",
+            "reason": "dependency_unhealthy",
+            "blocked_dependencies": blocked,
+            "deferred_at": now,
+            "retry_at": retry_at,
+            "deferrals": deferrals,
+        }
+        self._scheduled[task["id"]] = {
+            "task": task,
+            "due_at": retry_at,
+            "queue": queue,
+            "priority": task.get("priority", 0),
+        }
+        self._record_audit(
+            "task_deferred_dependency_health_gate",
+            task_id=task["id"],
+            queue=queue,
+            blocked_dependencies=blocked,
+            retry_at=retry_at,
+            deferrals=deferrals,
+        )
+
+    def _record_audit(self, action: str, **metadata: Any) -> None:
+        record = {
+            "action": action,
+            "at": self._clock(),
+        }
+        for key, value in metadata.items():
+            record[key] = self._audit_value(value)
+        self._audit.append(record)
+
+    def _audit_value(self, value: Any) -> Any:
+        if isinstance(value, str):
+            return self._safe_text(value)
+        if isinstance(value, (bool, int, float)) or value is None:
+            return value
+        if isinstance(value, (list, tuple, set)):
+            ordered = sorted(value, key=lambda item: str(item))
+            return [
+                self._audit_value(item)
+                for item in ordered[:20]
+            ]
+        return self._safe_text(value)
+
+    def _safe_reason(self, reason: Optional[str]) -> Optional[str]:
+        if reason is None:
+            return None
+        text = self._safe_text(reason)
+        lowered = text.lower()
+        sensitive = ("secret", "token", "key", "password", "credential")
+        if any(marker in lowered for marker in sensitive):
+            return "redacted"
+        return text
+
+    def _safe_text(self, value: Any, limit: int = 160) -> str:
+        text = str(value).replace("\n", " ").replace("\r", " ")
+        if len(text) > limit:
+            return f"{text[:limit]}..."
+        return text
+
+    def _normalize_dependency_name(self, dependency: Any) -> str:
+        name = str(dependency).strip()
+        if not name:
+            raise ValueError("dependency name cannot be empty")
+        return name
+
+    def _normalize_dependencies(self, dependencies: Any) -> List[str]:
+        if dependencies is None:
+            return []
+        if isinstance(dependencies, str):
+            values = [dependencies]
+        elif isinstance(dependencies, dict):
+            values = dependencies.keys()
+        else:
+            try:
+                values = list(dependencies)
+            except TypeError:
+                values = [dependencies]
+
+        normalized = {
+            str(value).strip()
+            for value in values
+            if str(value).strip()
+        }
+        return sorted(normalized)
 
 # 2019-04-25T08:37:12 update
 
