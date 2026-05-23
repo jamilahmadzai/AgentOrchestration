@@ -1,4 +1,4 @@
-.PHONY: install test lint clean build run
+.PHONY: install test lint clean build run docker-context-check
 
 install:
 	uv sync
@@ -20,7 +20,10 @@ build:
 run:
 	uvicorn src.api.server:create_app --reload --host 0.0.0.0 --port 8000
 
-docker-build:
+docker-context-check:
+	python3 scripts/audit_docker_context.py
+
+docker-build: docker-context-check
 	docker compose -f infra/docker-compose.yml build
 
 docker-up:
