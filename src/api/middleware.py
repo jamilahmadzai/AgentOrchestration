@@ -15,6 +15,15 @@ from starlette.responses import Response
 
 logger = logging.getLogger(__name__)
 
+ALLOWED_REQUEST_ROLES = {"anonymous", "viewer", "operator", "admin", "service"}
+HEADER_SAFE_CHARS = set(
+    "abcdefghijklmnopqrstuvwxyz"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "0123456789"
+    "._:-"
+)
+MAX_CONTEXT_HEADER_LENGTH = 128
+
 correlation_id_var: contextvars.ContextVar[Optional[str]] = (
     contextvars.ContextVar("correlation_id", default=None)
 )
@@ -243,7 +252,7 @@ def _build_request_context(request: Request) -> RequestContext:
         _state_or_scope(request, "role", "active_role", "auth_role")
         or request.headers.get("X-Role"),
         "anonymous",
-    )
+    ).lower()
     correlation_id = _safe_header(
         request.headers.get("X-Correlation-ID"),
         str(uuid4()),
@@ -284,11 +293,17 @@ def _context_header_mismatch(request: Request) -> Optional[Response]:
     ):
         return Response(status_code=403, content="Tenant context mismatch")
     state_role = _state_or_scope(request, "role", "active_role", "auth_role")
+    state_role = state_role.lower() if state_role else None
+    raw_header_role = request.headers.get("X-Role")
     header_role = (
-        _safe_header(request.headers.get("X-Role"), "")
-        if request.headers.get("X-Role")
+        _safe_header(raw_header_role, "").lower()
+        if raw_header_role
         else None
     )
+    if raw_header_role and (
+        not header_role or header_role not in ALLOWED_REQUEST_ROLES
+    ):
+        return Response(status_code=403, content="Unsupported request role")
     if state_role and header_role and state_role != header_role:
         return Response(status_code=403, content="Role context mismatch")
     return None
@@ -312,7 +327,10 @@ def _safe_header(value: Optional[str], default: str) -> str:
     value = value.strip()
     if not value:
         return default
-    return value[:128]
+    value = value[:MAX_CONTEXT_HEADER_LENGTH]
+    if any(character not in HEADER_SAFE_CHARS for character in value):
+        return default
+    return value
 
 
 def _scope_hash(tenant_id: str, role: str) -> str:

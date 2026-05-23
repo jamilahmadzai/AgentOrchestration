@@ -13,10 +13,12 @@ from src.api.middleware import (
 def build_client(raise_server_exceptions=True):
     correlation_scope_registry.clear()
     app = FastAPI()
+    app.state.context_hits = 0
     app.add_middleware(RequestContextMiddleware)
 
     @app.get("/context")
     async def context():
+        app.state.context_hits += 1
         current = get_request_context()
         return {
             "correlation_id": current.correlation_id if current else None,
@@ -133,6 +135,28 @@ def test_rejected_workspace_mismatch_is_sanitized_and_skips_handler(caplog):
     assert caplog.records[0].context_scope == response.headers[
         "X-Context-Scope"
     ]
+    assert client.app.state.context_hits == 0
+    assert get_request_context() is None
+
+
+def test_rejected_unsupported_role_is_sanitized_and_skips_handler(caplog):
+    client = build_client()
+
+    with caplog.at_level(logging.WARNING, logger="src.api.middleware"):
+        response = client.get(
+            "/context",
+            headers={
+                "X-Correlation-ID": "corr-role",
+                "X-Tenant-ID": "tenant-a",
+                "X-Role": "superadmin-secret",
+            },
+        )
+
+    assert response.status_code == 403
+    assert response.text == "Unsupported request role"
+    assert response.headers["X-Context-Decision"] == "rejected"
+    assert "superadmin-secret" not in caplog.text
+    assert client.app.state.context_hits == 0
     assert get_request_context() is None
 
 
