@@ -141,37 +141,39 @@ class TaskScheduler:
             if queue not in self._queues or len(self._queues[queue]) == 0:
                 return None
 
-            task = self._queues[queue].pop()
-            if not task:
-                return None
+            while len(self._queues[queue]) > 0:
+                task = self._queues[queue].pop()
+                if not task:
+                    continue
 
-            blocked = self._blocked_dependencies(task, queue)
-            if blocked:
-                self._defer_for_health_gate(task, queue, blocked)
-                return None
+                blocked = self._blocked_dependencies(task, queue)
+                if blocked:
+                    self._defer_for_health_gate(task, queue, blocked)
+                    continue
 
-            task_id = task["id"]
-            previous_gate = task.get("health_gate", {})
-            self._in_flight[task_id] = task
-            if previous_gate.get("decision") == "deferred":
-                task["health_gate"] = {
-                    "decision": "released",
-                    "released_at": self._clock(),
-                    "blocked_dependencies": previous_gate.get(
-                        "blocked_dependencies",
-                        [],
-                    ),
-                }
-                self._record_audit(
-                    "task_released_dependency_health_gate",
-                    task_id=task_id,
-                    queue=queue,
-                    blocked_dependencies=previous_gate.get(
-                        "blocked_dependencies",
-                        [],
-                    ),
-                )
-            return task
+                task_id = task["id"]
+                previous_gate = task.get("health_gate", {})
+                self._in_flight[task_id] = task
+                if previous_gate.get("decision") == "deferred":
+                    task["health_gate"] = {
+                        "decision": "released",
+                        "released_at": self._clock(),
+                        "blocked_dependencies": previous_gate.get(
+                            "blocked_dependencies",
+                            [],
+                        ),
+                    }
+                    self._record_audit(
+                        "task_released_dependency_health_gate",
+                        task_id=task_id,
+                        queue=queue,
+                        blocked_dependencies=previous_gate.get(
+                            "blocked_dependencies",
+                            [],
+                        ),
+                    )
+                return task
+            return None
 
     def complete(self, task_id: str) -> bool:
         with self._lock:

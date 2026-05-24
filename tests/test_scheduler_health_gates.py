@@ -98,7 +98,6 @@ def test_blocked_task_does_not_hold_ready_independent_work():
     )
     ready_id = scheduler.enqueue({"type": "local-cleanup"}, priority=1)
 
-    assert run(scheduler.dequeue()) is None
     ready = run(scheduler.dequeue())
 
     assert blocked_id in scheduler.scheduled_ids()
